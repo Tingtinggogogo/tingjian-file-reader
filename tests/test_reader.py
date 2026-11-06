@@ -9,7 +9,7 @@ from pathlib import Path
 os.environ['DATA_DIR'] = tempfile.mkdtemp(prefix='reader-test-')
 os.environ.setdefault('DATABASE_URL', 'sqlite:///' + os.environ['DATA_DIR'] + '/test.db')
 os.environ['SESSION_SECRET'] = 'test-session-secret-that-is-long-enough'
-os.environ['ACCESS_CODE'] = 'test-access-code-1234'
+os.environ['ENABLE_EDGE_TTS'] = 'true'
 os.environ['COOKIE_SECURE'] = 'false'
 os.environ['ALLOWED_ORIGINS'] = 'http://testserver'
 
@@ -26,9 +26,9 @@ def client():
     with main.DB.begin() as db:
         db.execute(text('DELETE FROM jobs'))
         db.execute(text('DELETE FROM drafts'))
-    main.ATTEMPTS.clear()
+        db.execute(text('DELETE FROM usage_limits'))
     c = TestClient(main.app, headers={'Origin': 'http://testserver'})
-    assert c.post('/api/login', json={'code': os.environ['ACCESS_CODE']}).status_code == 200
+    assert c.post('/api/session', json={}).status_code == 200
     yield c
     c.close()
 
@@ -43,22 +43,29 @@ def test_01_authentication_and_secure_headers(client):
     assert response.headers['x-content-type-options'] == 'nosniff'
 
 
-def test_02_login_rate_limit(client):
-    for _ in range(9):
-        assert client.post('/api/login', json={'code': 'wrong'}).status_code == 401
-    assert client.post('/api/login', json={'code': 'wrong'}).status_code == 429
+def test_02_anonymous_identity_persists_and_rejects_forgery(client):
+    client.put('/api/draft', json={'content': '记住我', 'consent': True})
+    response = client.post('/api/session', json={})
+    assert response.status_code == 200
+    assert 'HttpOnly' in response.headers['set-cookie']
+    assert 'SameSite=strict' in response.headers['set-cookie']
+    assert client.get('/api/draft').json()['content'] == '记住我'
+    client.cookies.clear(); client.cookies.set('reader_session', 'forged')
+    assert client.get('/api/draft').status_code == 401
+    assert client.post('/api/session', json={}).status_code == 200
+    assert client.get('/api/draft').json()['content'] == ''
 
 
 def test_03_csrf_origin_required(client):
     assert client.put('/api/draft', json={'content': 'test'}, headers={'Origin': 'https://evil.test'}).status_code == 403
-    assert TestClient(main.app).post('/api/login', json={'code': os.environ['ACCESS_CODE']}).status_code == 403
+    assert TestClient(main.app).post('/api/session', json={}).status_code == 403
 
 
 def test_04_session_isolation_and_drafts(client):
-    client.put('/api/draft', json={'content': '私人中文草稿'})
+    client.put('/api/draft', json={'content': '私人中文草稿', 'consent': True})
     assert client.get('/api/draft').json()['content'] == '私人中文草稿'
     other = TestClient(main.app, headers={'Origin': 'http://testserver'})
-    other.post('/api/login', json={'code': os.environ['ACCESS_CODE']})
+    other.post('/api/session', json={})
     assert other.get('/api/draft').json()['content'] == ''
 
 
@@ -113,10 +120,10 @@ def test_09_archive_bomb_and_empty_pdf():
 
 
 def test_10_speech_consent_validation_and_queue(client):
-    assert client.post('/api/speech', json={'content': ''}).status_code == 422
-    assert client.post('/api/speech', json={'content': '你好', 'provider': 'edge'}).status_code == 422
+    assert client.post('/api/speech', json={'content': '', 'consent': True}).status_code == 422
+    assert client.post('/api/speech', json={'content': '你好'}).status_code == 422
     assert client.post('/api/speech', json={'content': '你好', 'voice': 'arbitrary-command'}).status_code == 422
-    result = client.post('/api/speech', json={'content': '你好'})
+    result = client.post('/api/speech', json={'content': '你好', 'consent': True})
     assert result.status_code == 202
     assert client.get('/api/jobs').json()[0]['status'] == 'queued'
     assert client.get('/api/audio/' + result.json()['id']).status_code == 404
@@ -124,35 +131,35 @@ def test_10_speech_consent_validation_and_queue(client):
 
 def test_11_speech_quota(client):
     for _ in range(10):
-        assert client.post('/api/speech', json={'content': '中文朗读'}).status_code == 202
-    assert client.post('/api/speech', json={'content': '额外请求'}).status_code == 429
+        assert client.post('/api/speech', json={'content': '中文朗读', 'consent': True}).status_code == 202
+    assert client.post('/api/speech', json={'content': '额外请求', 'consent': True}).status_code == 429
 
 
 def test_12_audio_ownership_and_cleanup(client):
-    job_id = client.post('/api/speech', json={'content': '音频'}).json()['id']
-    path = main.DATA / (job_id + '.wav'); path.write_bytes(b'RIFF-test')
+    job_id = client.post('/api/speech', json={'content': '音频', 'consent': True}).json()['id']
+    path = main.DATA / (job_id + '.mp3'); path.write_bytes(b'RIFF-test')
     with main.DB.begin() as db:
         db.execute(text("UPDATE jobs SET status='done' WHERE id=:id"), {'id': job_id})
     assert client.get('/api/audio/' + job_id).status_code == 200
     other = TestClient(main.app, headers={'Origin': 'http://testserver'})
-    other.post('/api/login', json={'code': os.environ['ACCESS_CODE']})
+    other.post('/api/session', json={})
     assert other.get('/api/audio/' + job_id).status_code == 404
-    client.put('/api/draft', json={'content': 'clear me'})
+    client.put('/api/draft', json={'content': 'clear me', 'consent': True})
     assert client.delete('/api/data').status_code == 200
     assert not path.exists()
     assert client.get('/api/draft').json()['content'] == ''
 
 
 def test_13_expiry_recovery_and_active_delete(client):
-    job_id = client.post('/api/speech', json={'content': '过期内容'}).json()['id']
+    job_id = client.post('/api/speech', json={'content': '过期内容', 'consent': True}).json()['id']
     assert client.delete('/api/data').status_code == 409
-    path = main.DATA / (job_id + '.wav'); path.write_bytes(b'test')
+    path = main.DATA / (job_id + '.mp3'); path.write_bytes(b'test')
     with main.DB.begin() as db:
         db.execute(text("UPDATE jobs SET status='processing' WHERE id=:id"), {'id': job_id})
     main.initialize()
     assert client.get('/api/jobs').json()[0]['status'] == 'queued'
     with main.DB.begin() as db:
-        db.execute(text("UPDATE jobs SET created=:t WHERE id=:id"), {'id': job_id, 't': time.time() - 90000})
+        db.execute(text("UPDATE jobs SET created=:t WHERE id=:id"), {'id': job_id, 't': time.time() - 31 * 86400})
     main.cleanup()
     assert client.get('/api/jobs').json() == []
     assert not path.exists()
@@ -162,8 +169,9 @@ def test_14_offline_real_synthesis_or_error_reporting(client, monkeypatch):
     import shutil
     import subprocess
     import threading
-    job_id = client.post('/api/speech', json={'content': '你好，这是中文朗读测试。'}).json()['id']
-    real_run = subprocess.run
+    job_id = client.post('/api/speech', json={'content': '你好，这是中文朗读测试。', 'consent': True}).json()['id']
+    with main.DB.begin() as db:
+        db.execute(text("UPDATE jobs SET provider='offline' WHERE id=:id"), {'id': job_id})
     def unavailable(*args, **kwargs):
         raise subprocess.CalledProcessError(1, ['espeak-ng'])
     installed = shutil.which('espeak-ng') is not None or (main.sys.platform == 'darwin' and Path('/usr/bin/say').exists())
@@ -188,24 +196,17 @@ def test_14_offline_real_synthesis_or_error_reporting(client, monkeypatch):
         main.STOP.set(); thread.join(3)
 
 
-def test_15_natural_voice_rate_metadata_and_preview_privacy(client, monkeypatch):
-    monkeypatch.setattr(main, 'EDGE_ENABLED', True)
-    client.put('/api/draft', json={'content': '不应该发送的私人草稿'})
-    assert client.post('/api/speech', json={'content': '你好', 'provider': 'edge', 'consent': False}).status_code == 422
-    for voice in ('female', 'xiaoyi', 'male'):
-        result = client.post('/api/preview', json={'voice': voice, 'rate': 'slow', 'content': '不应该发送的额外内容'})
-        assert result.status_code == 202
-        with main.DB.connect() as db:
-            job = db.execute(text('SELECT * FROM jobs WHERE id=:id'), result.json()).mappings().one()
-            assert job['content'] == main.PREVIEW_TEXT
-            assert (job['voice'], job['rate'], job['kind']) == (voice, 'slow', 'preview')
-    assert client.get('/api/draft').json()['content'] == '不应该发送的私人草稿'
-    assert client.get('/api/jobs').json()[0]['kind'] == 'preview'
-    assert client.post('/api/preview', json={'voice': 'invalid'}).status_code == 422
-    assert client.post('/api/preview', json={'rate': '+999%'}).status_code == 422
-    assert TestClient(main.app, headers={'Origin': 'http://testserver'}).post('/api/preview', json={}).status_code == 401
+def test_15_only_xiaoxiao_can_be_requested_with_explicit_consent(client, monkeypatch):
+    assert client.post('/api/speech', json={'content': '你好'}).status_code == 422
+    for extra in ({'voice': 'male'}, {'provider': 'offline'}, {'rate': 'fast'}):
+        assert client.post('/api/speech', json={'content': '你好', 'consent': True, **extra}).status_code == 422
+    result = client.post('/api/speech', json={'content': '你好', 'title': '我的文件.txt', 'consent': True})
+    assert result.status_code == 202
+    with main.DB.connect() as db:
+        job = db.execute(text('SELECT * FROM jobs WHERE id=:id'), result.json()).mappings().one()
+        assert (job['voice'], job['provider'], job['rate'], job['title']) == ('female', 'edge', 'slow', '我的文件.txt')
     monkeypatch.setattr(main, 'EDGE_ENABLED', False)
-    assert client.post('/api/preview', json={}).status_code == 422
+    assert client.post('/api/speech', json={'content': '你好', 'consent': True}).status_code == 422
 
 
 def test_16_additive_migration_preserves_existing_jobs_and_drafts(tmp_path, monkeypatch):
@@ -242,3 +243,41 @@ def test_17_edge_voice_and_rate_forwarded_without_text_fragmentation(tmp_path, m
     assert len(calls) == 3
     with pytest.raises(ValueError):
         synthesize(content, 'female', 'edge', tmp_path / 'test.mp3', 'invalid')
+
+
+def test_18_global_budget_survives_new_browser_and_job_deletion(client):
+    with main.DB.begin() as db:
+        db.execute(text('INSERT INTO usage_limits(bucket,count,created) VALUES(:b,100,:t)'),
+                   {'b': f'speech-hour:{int(time.time() // 3600)}', 't': time.time()})
+    assert client.delete('/api/data').status_code == 200
+    client.cookies.clear(); client.post('/api/session', json={})
+    assert client.post('/api/speech', json={'content': '你好', 'consent': True}).status_code == 429
+    assert client.get('/api/jobs').json() == []
+
+
+def test_19_history_retention_pagination_and_isolation(client):
+    first = client.post('/api/speech', json={'content': '你好', 'consent': True}).json()['id']
+    with main.DB.begin() as db:
+        who = db.execute(text('SELECT owner FROM jobs WHERE id=:id'), {'id': first}).scalar_one()
+        db.execute(text("UPDATE jobs SET status='done',created=:t WHERE id=:id"), {'t': time.time() - 2 * 86400, 'id': first})
+        for index in range(25):
+            db.execute(text("""INSERT INTO jobs(id,owner,content,voice,provider,status,error,created)
+                VALUES(:id,:o,'','female','edge','done','',:t)"""), {'id': str(uuid.uuid4()), 'o': who, 't': time.time() - index})
+    main.cleanup()
+    assert len(client.get('/api/jobs').json()) == 20
+    second = client.get('/api/jobs?offset=20').json()
+    assert len(second) == 6 and second[-1]['id'] == first
+    assert client.get('/api/jobs?offset=-1').status_code == 422
+    other = TestClient(main.app, headers={'Origin': 'http://testserver'})
+    other.post('/api/session', json={})
+    assert other.get('/api/jobs').json() == []
+
+
+def test_20_storage_and_upload_budgets(client, monkeypatch):
+    monkeypatch.setattr(main, 'MAX_AUDIO_BYTES', 0)
+    assert client.post('/api/speech', json={'content': '你好', 'consent': True}).status_code == 503
+    monkeypatch.setattr(main, 'MAX_AUDIO_BYTES', 5 * 1024 ** 3)
+    with main.DB.begin() as db:
+        db.execute(text('INSERT INTO usage_limits(bucket,count,created) VALUES(:b,120,:t)'),
+                   {'b': f'uploads-hour:{int(time.time() // 3600)}', 't': time.time()})
+    assert client.post('/api/extract', files={'file': ('test.txt', '你好'.encode())}).status_code == 429

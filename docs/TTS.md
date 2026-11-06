@@ -1,33 +1,17 @@
 # 中文语音与中国大陆访问
 
-## 离线选项：eSpeak NG
+当前页面固定晓晓自然女声 `zh-CN-XiaoxiaoNeural`，舒缓语速 `-15%`。无需音色/语速选择或试听步骤；点击“生成朗读”前展示明确说明，点击后以 `consent=true` 提交文字。后端拒绝客户端自定义引擎/音色/语速。旧录音仍可回听，不会自动转换。
 
-镜像安装 eSpeak NG，固定 `cmn` 普通话音色，生成 WAV，无需将文字发送给第三方，CPU 即可运行。音色较机械、WAV 文件较大；名字、缩写及中英混排读音可能不准。离线指语音合成不需要外部服务，用户访问首尔服务器、上传和播放仍然需要网络。首次安装镜像和语言包仍需要网络。
+## 微软在线服务
 
-eSpeak NG 上游：https://github.com/espeak-ng/espeak-ng 。其软件许可与依赖许可需在分发镜像时保留；公开代码仓库本身不包含语音引擎二进制。
+[Edge-TTS](https://github.com/rany2/edge-tts) 使用微软 Edge 在线语音服务，并非离线引擎，也不是有服务等级保障的付费 Azure Speech API。文字从首尔服务器发送给微软；仅打开页面或选择文件不会发送给微软。`ENABLE_EDGE_TTS=true` 为当前默认，设为 false 后拒绝生成，不会静默切换机械音色。
 
-macOS 本机预览若未安装 eSpeak NG，则使用系统已安装的 `Tingting` 音色生成 WAV；不自动下载语音包。本机音质不能代表 Linux 的 eSpeak NG。
+“舒缓”只指语速，不是 Azure 的 gentle 情感风格。Edge-TTS 不提供自定义情感 SSML。首尔到微软和大陆用户到首尔两段链路均可能波动，不能保证所有运营商始终可达。失败时明确提示重试，用户不应提交保密内容。
 
-## 自然音色：Edge-TTS
+## 可选离线升级
 
-上游 https://github.com/rany2/edge-tts 明确使用 Microsoft Edge 在线文字转语音服务。它不是离线引擎，也不是有服务等级保障的付费 Azure Speech API。文字通过首尔服务器发送到微软；接口、限速或服务策略变化都可能导致失败。
+当前镜像保留 eSpeak NG，固定 cmn 普通话，CPU 生成 WAV，但音色机械；macOS 的兼容测试可使用已安装的 Tingting。旧版离线作业可继续处理，用户页面不再提供离线入口。[eSpeak NG](https://github.com/espeak-ng/espeak-ng) 软件分发需保留许可。
 
-默认 `ENABLE_EDGE_TTS=false`。管理员评估数据要求后可在独立环境启用。启用后页面默认选择晓晓女声、舒缓语速。文件朗读必须勾选发送确认；试听按钮只发送页面公开展示的固定短句，既不读取草稿，也不使用上传内容。在线失败会明确报错，不自动替换成机械音色。
+更自然的离线方案可评估 [Piper](https://github.com/OHF-Voice/piper1-gpl) 中文模型，当前未集成。需核查引擎及模型许可、预下载校验模型、评估服务器内存与音质，通过功能分支与独立环境验收再引入。不在用户上传后自动下载模型。
 
-大陆用户到首尔的链路以及首尔到微软的链路均需实测。不要承诺大陆永远可达，也不要将机密、个人敏感信息发送给在线引擎。公网开放仅为便利，不等于敏感数据存储系统。
-
-## 更自然的离线升级
-
-可评估 Piper：https://github.com/OHF-Voice/piper1-gpl ，其语音目录提供中文模型。当前代码未集成 Piper，不会在用户上传文件后临时下载模型。若升级，需先选定模型、核查引擎与模型各自的许可证、离线下载并校验文件、测试音色与内存，再通过功能分支/PR/staging 引入。也可评估中文专用离线引擎，但不同引擎可能需要更多内存或 GPU。
-
-手机系统的 Web Speech API 不作为可靠离线保证：声音、可用语言与是否联网由系统/浏览器决定，内置浏览器支持不一致。本版统一由服务器生成音频。
-
-## 音色、试听与语速
-
-- 晓晓：`zh-CN-XiaoxiaoNeural` 女声；晓伊：`zh-CN-XiaoyiNeural` 女声；云希：`zh-CN-YunxiNeural` 男声。
-- 舒缓、标准、稍快对应 Edge 的 -15%、0%、+15%；离线对应 140/165/190 字词每分钟参数。
-- 舒缓仅指语速，不是微软 Azure 的 gentle 情感风格。Edge-TTS 不提供自定义情感 SSML，不能将 Azure 支持的情感风格宣称为本工具已具备。声音偏好请用同一短句试听决定。
-- `/api/preview` 要求登录，固定服务端示例，参数仅支持音色/语速白名单，在线服务关闭时拒绝。试听与文件朗读共用队列、10 次/小时额度及 24 小时清理。
-- 旧录音不会随选择变化，需重新生成；列表显示音色、语速和试听标记。旧离线录音明确显示“离线机械音色”。
-
-参考：[edge-tts 上游说明](https://github.com/rany2/edge-tts)、[微软官方语音目录](https://learn.microsoft.com/azure/cognitive-services/speech-service/language-support?tabs=tts)。
+[微软官方音色目录](https://learn.microsoft.com/azure/cognitive-services/speech-service/language-support?tabs=tts)。

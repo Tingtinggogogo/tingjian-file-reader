@@ -45,7 +45,6 @@ jobs:
         env:
           POSTGRES_PASSWORD: ci-only-password
           SESSION_SECRET: ci-only-secret-at-least-32-characters
-          ACCESS_CODE: ci-only-access-code
           ALLOWED_ORIGINS: https://staging.example.invalid
           APP_PORT: '18081'
         run: docker compose --project-name reader-staging config --quiet

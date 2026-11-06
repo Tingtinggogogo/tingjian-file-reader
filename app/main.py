@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import os
 import secrets
 import shutil
@@ -11,35 +9,36 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import create_engine, inspect, text
 
 DATA = Path(os.getenv('DATA_DIR', 'data')).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
 SECRET = os.getenv('SESSION_SECRET', '')
-ACCESS = os.getenv('ACCESS_CODE', '')
-if len(SECRET) < 32 or len(ACCESS) < 12 or SECRET.startswith('REPLACE_') or ACCESS.startswith('REPLACE_'):
-    raise RuntimeError('SESSION_SECRET 至少 32 字符，ACCESS_CODE 至少 12 字符；请配置 .env')
+if len(SECRET) < 32 or SECRET.startswith('REPLACE_'):
+    raise RuntimeError('SESSION_SECRET 至少 32 字符；请配置 .env')
+HISTORY_DAYS = 30
+SESSION_AGE = 180 * 86400
+MAX_AUDIO_BYTES = 5 * 1024 ** 3
+MIN_FREE_BYTES = 1024 ** 3
 SIGNER = URLSafeTimedSerializer(SECRET)
 DB = create_engine(os.getenv('DATABASE_URL', 'sqlite:///' + str(DATA / 'reader.db')), pool_pre_ping=True)
 ORIGINS = set(os.getenv('ALLOWED_ORIGINS', 'http://localhost:8000,http://127.0.0.1:8000').split(','))
 COOKIE_SECURE = os.getenv('COOKIE_SECURE', 'true') == 'true'
-EDGE_ENABLED = os.getenv('ENABLE_EDGE_TTS', 'false') == 'true'
+EDGE_ENABLED = os.getenv('ENABLE_EDGE_TTS', 'true') == 'true'
 STOP = threading.Event()
-ATTEMPTS = {}
-LOCK = threading.Lock()
 SCHEMA = [
     'CREATE TABLE IF NOT EXISTS drafts (owner VARCHAR(64) PRIMARY KEY, content TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL)',
     '''CREATE TABLE IF NOT EXISTS jobs (id VARCHAR(36) PRIMARY KEY, owner VARCHAR(64) NOT NULL,
     content TEXT NOT NULL, voice VARCHAR(16) NOT NULL, provider VARCHAR(16) NOT NULL,
     status VARCHAR(16) NOT NULL, error TEXT NOT NULL, created DOUBLE PRECISION NOT NULL)''',
     'CREATE INDEX IF NOT EXISTS jobs_owner_created ON jobs(owner, created)',
+    'CREATE TABLE IF NOT EXISTS usage_limits (bucket VARCHAR(48) PRIMARY KEY, count INTEGER NOT NULL, created DOUBLE PRECISION NOT NULL)',
 ]
 
 
@@ -49,9 +48,9 @@ def initialize():
             db.execute(text(statement))
         # Additive migration preserves drafts, queued work, and existing audio.
         columns = {column['name'] for column in inspect(db).get_columns('jobs')}
-        for column, default in (('rate', 'normal'), ('kind', 'reading')):
+        for column, default in (('rate', 'normal'), ('kind', 'reading'), ('title', '文件朗读')):
             if column not in columns:
-                db.execute(text(f"ALTER TABLE jobs ADD COLUMN {column} VARCHAR(16) NOT NULL DEFAULT '{default}'"))
+                db.execute(text(f"ALTER TABLE jobs ADD COLUMN {column} VARCHAR(160) NOT NULL DEFAULT '{default}'"))
         # One application process only; recover interrupted tasks after restart.
         db.execute(text("UPDATE jobs SET status='queued' WHERE status='processing'"))
 
@@ -61,11 +60,12 @@ def cleanup():
     for directory in DATA.glob('upload-*'):
         if directory.is_dir() and directory.stat().st_mtime < time.time() - 3600:
             shutil.rmtree(directory, ignore_errors=True)
-    cutoff = time.time() - 86400
+    cutoff = time.time() - HISTORY_DAYS * 86400
     with DB.begin() as db:
         ids = db.execute(text('SELECT id FROM jobs WHERE created < :c'), {'c': cutoff}).scalars().all()
         db.execute(text('DELETE FROM jobs WHERE created < :c'), {'c': cutoff})
-        db.execute(text('DELETE FROM drafts WHERE updated < :c'), {'c': cutoff})
+        db.execute(text('DELETE FROM drafts WHERE updated < :c'), {'c': time.time() - 86400})
+        db.execute(text('DELETE FROM usage_limits WHERE created < :c'), {'c': time.time() - 172800})
     for job_id in ids:
         for ext in ('mp3', 'wav', 'txt'):
             (DATA / f'{job_id}.{ext}').unlink(missing_ok=True)
@@ -135,33 +135,38 @@ async def security(request: Request, call_next):
 
 def owner(request):
     try:
-        value = SIGNER.loads(request.cookies.get('reader_session', ''), max_age=86400)
+        value = SIGNER.loads(request.cookies.get('reader_session', ''), max_age=SESSION_AGE)
         if not isinstance(value, str) or len(value) != 32:
             raise BadSignature('invalid')
         return value
     except (BadSignature, SignatureExpired):
-        raise HTTPException(401, '请先输入访问口令。')
-
-
-class Login(BaseModel):
-    code: str = Field(max_length=128)
+        raise HTTPException(401, '浏览器记录已失效，请刷新页面后重试。')
 
 
 class Content(BaseModel):
     content: str = Field(max_length=30000)
 
 
-class VoiceSettings(BaseModel):
-    voice: Literal['female', 'xiaoyi', 'male'] = 'female'
-    rate: Literal['slow', 'normal', 'fast'] = 'normal'
-
-
-class Speech(Content, VoiceSettings):
-    provider: Literal['offline', 'edge'] = 'offline'
+class Speech(Content):
+    model_config = ConfigDict(extra='forbid')
+    title: str = Field(default='文件朗读', max_length=160)
     consent: bool = False
 
 
-PREVIEW_TEXT = '你好，欢迎使用听见文件。让眼睛休息一下，我们慢慢来，把文字读给你听。'
+def reserve_usage(db, name, period, limit):
+    now = time.time()
+    bucket = f'{name}:{int(now // period)}'
+    count = db.execute(text("""INSERT INTO usage_limits(bucket,count,created) VALUES(:b,1,:t)
+        ON CONFLICT(bucket) DO UPDATE SET count=usage_limits.count+1 RETURNING count"""),
+                       {'b': bucket, 't': now}).scalar_one()
+    if count > limit:
+        raise HTTPException(429, '当前使用人数较多，请稍后再试。')
+
+
+def check_storage():
+    used = sum(p.stat().st_size for p in DATA.iterdir() if p.is_file() and p.suffix in {'.mp3', '.wav'})
+    if used >= MAX_AUDIO_BYTES or shutil.disk_usage(DATA).free < MIN_FREE_BYTES:
+        raise HTTPException(503, '存储空间暂时不足，请稍后再试。')
 
 
 @app.get('/api/health')
@@ -171,40 +176,19 @@ def health():
     return {'status': 'ok'}
 
 
-@app.post('/api/login')
-def login(body: Login, request: Request):
-    from fastapi.responses import JSONResponse
-    ip = request.client.host if request.client else 'unknown'
-    now = time.time()
-    with LOCK:
-        for key in list(ATTEMPTS):
-            if now - ATTEMPTS[key][0] > 600:
-                ATTEMPTS.pop(key)
-        start, count = ATTEMPTS.get(ip, (now, 0))
-        if count >= 10:
-            raise HTTPException(429, '尝试过多，请 10 分钟后再试。')
-        ATTEMPTS[ip] = (start, count + 1)
-    if not hmac.compare_digest(hashlib.sha256(body.code.encode()).digest(), hashlib.sha256(ACCESS.encode()).digest()):
-        raise HTTPException(401, '口令不正确。')
-    response = JSONResponse({'ok': True})
-    response.set_cookie('reader_session', SIGNER.dumps(secrets.token_hex(16)), httponly=True,
-                        secure=COOKIE_SECURE, samesite='strict', max_age=86400)
-    return response
-
-
-@app.get('/api/session')
+@app.post('/api/session')
 def session(request: Request):
-    owner(request)
-    from app.extract import SUPPORTED
-    return {'edge_enabled': EDGE_ENABLED, 'extensions': sorted(SUPPORTED), 'native_mac': sys.platform == 'darwin'}
-
-
-@app.post('/api/logout')
-def logout(request: Request):
+    # A private browser identity, not a shared public history. Preserve old cookies.
     from fastapi.responses import JSONResponse
-    owner(request)
-    response = JSONResponse({'ok': True})
-    response.delete_cookie('reader_session')
+    from app.extract import SUPPORTED
+    try:
+        who = owner(request)
+    except HTTPException:
+        who = secrets.token_hex(16)
+    response = JSONResponse({'edge_enabled': EDGE_ENABLED, 'extensions': sorted(SUPPORTED),
+                             'history_days': HISTORY_DAYS})
+    response.set_cookie('reader_session', SIGNER.dumps(who), httponly=True,
+                        secure=COOKIE_SECURE, samesite='strict', max_age=SESSION_AGE)
     return response
 
 
@@ -220,6 +204,7 @@ def get_draft(request: Request):
 def save_draft(body: Content, request: Request):
     who = owner(request)
     with DB.begin() as db:
+        reserve_usage(db, 'drafts-hour', 3600, 600)
         db.execute(text('''INSERT INTO drafts(owner,content,updated) VALUES(:o,:c,:u)
         ON CONFLICT(owner) DO UPDATE SET content=:c,updated=:u'''), {'o': who, 'c': body.content, 'u': time.time()})
     return {'ok': True}
@@ -236,6 +221,9 @@ def upload(request: Request, file: UploadFile = File(...)):
     name = Path(file.filename or '').name[:160]
     if Path(name).suffix.lower() not in SUPPORTED:
         raise HTTPException(415, '暂不支持此类型，请查看页面上的支持格式。')
+    check_storage()
+    with DB.begin() as db:
+        reserve_usage(db, 'uploads-hour', 3600, 120)
     if not PARSERS.acquire(blocking=False):
         raise HTTPException(429, '正在处理其他文件，请稍后重试。')
     try:
@@ -269,19 +257,13 @@ def speech(body: Speech, request: Request):
     return enqueue(body, request)
 
 
-@app.post('/api/preview', status_code=202)
-def preview(body: VoiceSettings, request: Request):
-    # Only this public sample is submitted; never read the user's draft.
-    return enqueue(Speech(content=PREVIEW_TEXT, voice=body.voice, rate=body.rate,
-                          provider='edge', consent=True), request, kind='preview')
-
-
-def enqueue(body: Speech, request: Request, kind='reading'):
+def enqueue(body: Speech, request: Request):
     who = owner(request)
     if not body.content.strip():
         raise HTTPException(422, '请先上传文件或输入文字。')
-    if body.provider == 'edge' and (not EDGE_ENABLED or not body.consent):
+    if not EDGE_ENABLED or not body.consent:
         raise HTTPException(422, '在线语音未启用，或你尚未同意将文字发送至微软。')
+    check_storage()
     job = str(uuid.uuid4())
     with DB.begin() as db:
         # Serialize quota checks between sessions in PostgreSQL.
@@ -291,18 +273,22 @@ def enqueue(body: Speech, request: Request, kind='reading'):
         count = db.execute(text('SELECT COUNT(*) FROM jobs WHERE owner=:o AND created>:t'), {'o': who, 't': time.time() - 3600}).scalar()
         if pending >= 20 or count >= 10:
             raise HTTPException(429, '队列已满或已达到每小时 10 次限制，请稍后再试。')
-        db.execute(text('''INSERT INTO jobs(id,owner,content,voice,provider,rate,kind,status,error,created)
-        VALUES(:id,:o,:c,:v,:p,:r,:k,'queued','',:t)'''),
-                   {'id': job, 'o': who, 'c': body.content.strip(), 'v': body.voice, 'p': body.provider,
-                    'r': body.rate, 'k': kind, 't': time.time()})
+        reserve_usage(db, 'speech-hour', 3600, 100)
+        reserve_usage(db, 'speech-day', 86400, 500)
+        db.execute(text('''INSERT INTO jobs(id,owner,content,voice,provider,rate,kind,title,status,error,created)
+        VALUES(:id,:o,:c,'female','edge','slow','reading',:title,'queued','',:t)'''),
+                   {'id': job, 'o': who, 'c': body.content.strip(),
+                    'title': body.title.strip() or '文件朗读', 't': time.time()})
     return {'id': job, 'status': 'queued'}
 
 
 @app.get('/api/jobs')
-def jobs(request: Request):
+def jobs(request: Request, offset: int = 0):
     who = owner(request)
+    if offset < 0 or offset > 10000:
+        raise HTTPException(422, '历史页码无效。')
     with DB.connect() as db:
-        rows = db.execute(text('SELECT id,status,error,provider,voice,rate,kind,created FROM jobs WHERE owner=:o ORDER BY created DESC LIMIT 20'), {'o': who}).mappings().all()
+        rows = db.execute(text('SELECT id,status,error,provider,voice,rate,kind,title,created FROM jobs WHERE owner=:o ORDER BY created DESC,id DESC LIMIT 20 OFFSET :offset'), {'o': who, 'offset': offset}).mappings().all()
     return [dict(row) for row in rows]
 
 

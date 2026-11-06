@@ -21,10 +21,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://reader:${POSTGRES_PASSWORD}@db/reader
       SESSION_SECRET: ${SESSION_SECRET:?set a session secret}
-      ACCESS_CODE: ${ACCESS_CODE:?set an access code}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set the HTTPS origin}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
-      ENABLE_EDGE_TTS: ${ENABLE_EDGE_TTS:-false}
+      ENABLE_EDGE_TTS: ${ENABLE_EDGE_TTS:-true}
     depends_on:
       db: {condition: service_healthy}
     volumes:

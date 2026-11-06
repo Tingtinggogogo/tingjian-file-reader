@@ -10,7 +10,7 @@
 
 ## 源码与分支
 
-唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、17 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
+唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、20 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
 
 ## 环境准备
 
@@ -20,15 +20,14 @@
 
 ## staging：独立数据库与卷
 
-在服务器目录复制 .env.example 为 .env.staging，权限设为 600。分别生成随机十六进制数据库密码、会话密钥和至少 12 字符访问口令。切勿提交环境文件。
+在服务器目录复制 .env.example 为 .env.staging，权限设为 600。分别生成随机十六进制数据库密码和会话密钥。切勿提交环境文件。
 
 ```sh
 python3 -c 'import secrets; print(secrets.token_hex(24))'
 python3 -c 'import secrets; print(secrets.token_hex(32))'
-python3 -c 'import secrets; print(secrets.token_hex(12))'
 ```
 
-在 .env.staging 中设置 `APP_PORT=18081`、独立 `SESSION_SECRET`/`POSTGRES_PASSWORD`/`ACCESS_CODE`。`ALLOWED_ORIGINS` 为实际访问来源，不包含末尾斜杠。首选带证书的 staging 子域名；DNS/证书需另行核实。也可通过本机 SSH 隧道访问 HTTP 的 `http://127.0.0.1:18081`，此时仅 staging 设置 `COOKIE_SECURE=false`。此模式不可供公网手机验收，不要开放防火墙来替代 HTTPS。
+在 .env.staging 中设置 `APP_PORT=18081`、独立 `SESSION_SECRET`/`POSTGRES_PASSWORD`。`ALLOWED_ORIGINS` 为实际访问来源，不包含末尾斜杠。首选带证书的 staging 子域名；DNS/证书需另行核实。也可通过本机 SSH 隧道访问 HTTP 的 `http://127.0.0.1:18081`，此时仅 staging 设置 `COOKIE_SECURE=false`。此模式不可供公网手机验收，不要开放防火墙来替代 HTTPS。
 
 ```sh
 docker compose --env-file .env.staging --project-name tingjian-staging config --quiet
@@ -50,11 +49,11 @@ Nginx 修改前备份，`nginx -t` 通过后才 reload；不要重启其他业�
 ## 限制与运行检查
 
 - 单个应用实例、一个 worker；磁盘占用与内存要监控，声音最长 3 分钟合成超时，解析 60 秒超时。
-- 口令为受邀用户共用的入口，数据按设备会话隔离，不是实名账户系统；删除 Cookie/重新登录不会找回旧会话。共享口令下的会话配额不是严格的个人配额。
-- 代理后的应用登录限制按代理 IP 共享，Nginx 再提供入口限制。正式入口前还有代理/CDN 时需核实真实客户端 IP，不能盲信任任意 X-Forwarded-For。
+- 无口令公开访问，以签名 Cookie 隔离浏览器历史；不是实名账户系统。Cookie 有效 180 天并续期，录音保存 30 天，清除 Cookie/换设备无法找回。
+- Nginx 提供入口限制；不盲信任 X-Forwarded-For。数据库全站计数限制上传 120 次/小时、朗读 100 次/小时及 500 次/日，清除会话或记录不能绕过；每会话 10 次/小时，队列 20 个；草稿写入全站 600 次/小时。
 - 原文件不长期保存；异常中断遗留的上传临时目录会在下次运行清理周期清除（至少一小时前的目录），维护时不能删除活跃任务。
 - 手工备份 PostgreSQL 时注意包含用户文字，权限与保留时长应单独制定。自动清理不影响已导出的备份。
-- 回滚应检出 GitHub 上一个批准提交重建应用，保留数据库卷；禁止 `down -v`。当前 schema 只创建表和索引，未来变更需添加独立迁移和回滚说明。
+- 回滚应检出 GitHub 上一个批准提交重建应用，保留数据库卷；禁止 `down -v`。当前为兼容性增量迁移，新增列和用量表不影响旧版回滚；无需删除列或数据。
 - 构建需要 Python 镜像、PyPI、Debian 包源。首尔通常可获取，但须实测；不要添加未核实的镜像源或关闭 TLS 验证。
 
 ## 实际独立验收环境（2026-11-06）
@@ -79,4 +78,12 @@ curl --fail https://read.tinsmartfm.com/api/health
 
 仅在独立 reader staging 中设置 `ENABLE_EDGE_TTS=true`，重建 app 容器；数据库、音频卷及共享入口保持原样。先确认无 queued/processing 作业，再从 GitHub 获取通过 CI 的功能分支提交。不要修改 waste-web-production。启动时只给 jobs 增加 rate/kind 列，旧作业默认 normal/reading，保留草稿和录音。回滚到旧代码时无需删列，可恢复原配置关闭在线语音。
 
-上线前从首尔用固定公共短句实测三种音色；成功不代表中国大陆所有网络均可访问。不得用现有用户文件测试外部服务。
+上线前从首尔用固定公共短句实测晓晓音色；成功不代表中国大陆所有网络均可访问。不得用现有用户文件测试外部服务。
+
+## 无口令精简页面更新
+
+用户明确授权公开扫码使用。删除应用 ACCESS_CODE 要求和登录接口；已有 .env 中废弃的 ACCESS_CODE 可以保留但不再读取，不修改 SESSION_SECRET，以便保留已有浏览器历史。新浏览器通过同源 POST /api/session 自动取得隔离身份。无需修改公网端口、共享网关或 DNS。
+
+启动新增 jobs.title（旧值为“文件朗读”）及 usage_limits 表。用量计数只存时间桶/次数，不存 IP 或文件内容，保留约两天；历史文字和音频保留 30 天，草稿 24 小时。音频达到 5 GiB 或磁盘不足 1 GiB 时拒绝新增任务；单个运行中任务可能越过容量阈值少量空间。
+
+获取 CI 成功的确切 GitHub 提交，保留所有卷，重建 app；对本项目 web 执行 nginx -t 后 nginx -s reload，移除旧登录限流配置并刷新应用地址解析。其他业务容器不改动。回滚旧提交重建时可继续使用旧环境中口令；数据库新增字段保留。
