@@ -1,0 +1,5 @@
+# Separate hostname entry for the existing HTTPS gateway.
+# Gateway must be connected to the reader Compose egress network.
+read.tinsmartfm.com {
+    reverse_proxy tingjian-reader-staging-web-1:8080
+}

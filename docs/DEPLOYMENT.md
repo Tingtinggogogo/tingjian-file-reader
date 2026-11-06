@@ -6,7 +6,7 @@
 
 通过腾讯云控制台终端进行只读检查：Ubuntu 24.04，2 核/4 GB/60 GB，当前根磁盘可用约 39 GB，内存可用约 2 GB；Docker 29.6.1、Compose v5.3.1 已安装。用户 ubuntu，SSH 端口 22。已有多个生产应用和 PostgreSQL 容器，外部 80/443 由 Caddy 容器负责。
 
-本项目的 Nginx 配置仅用于内部应用入口，不替换现有 Caddy。正式接入需先核对可用子域名/DNS/路由及现有发布机制。未读取业务环境密钥，未修改服务器。用户要求暂不推送 GitHub，故尚未从 GitHub 部署本项目。
+本项目的 Nginx 配置仅用于内部应用入口，不替换现有 Caddy。正式接入需先核对可用子域名/DNS/路由及现有发布机制。随后用户授权完成推送与部署，已从独立仓库的 CI 成功提交构建独立验收环境；详见下方实际部署记录。未读取已有业务环境密钥。
 
 ## 源码与分支
 
@@ -56,3 +56,21 @@ Nginx 修改前备份，`nginx -t` 通过后才 reload；不要重启其他业�
 - 手工备份 PostgreSQL 时注意包含用户文字，权限与保留时长应单独制定。自动清理不影响已导出的备份。
 - 回滚应检出 GitHub 上一个批准提交重建应用，保留数据库卷；禁止 `down -v`。当前 schema 只创建表和索引，未来变更需添加独立迁移和回滚说明。
 - 构建需要 Python 镜像、PyPI、Debian 包源。首尔通常可获取，但须实测；不要添加未核实的镜像源或关闭 TLS 验证。
+
+## 实际独立验收环境（2026-11-06）
+
+地址 https://read.tinsmartfm.com ，部署目录 `/home/ubuntu/tingjian-file-reader-staging`，Compose 项目 `tingjian-reader-staging`。配置 `.env.staging` 权限 600，包含独立随机密钥；口令不进入源码。使用 GitHub 提交 `f9ce9937e681b730cae0474b181a6ca538353862`，PR 尚未合并。
+
+应用、数据库、Nginx 均属于新项目。现有 Caddy 入口仅新增 `/home/ubuntu/waste-proxy/tingjian-reader.caddy` 并在原 Caddyfile 末尾导入；备份命名为 `Caddyfile.before-tingjian-时间戳`。这个目录名称属于共享 HTTPS 网关，不代表把程序部署到 waste-web-production。网关容器已连接 `tingjian-reader-staging_egress` 网络。
+
+Caddy 原有业务路由保留。以后如果重建共享网关容器，应在其部署配置中保留新网络连接，或由管理员重新连接；如果销毁本工具网络再创建，也需重连。仅重启现有容器通常不会丢失网络连接。不要执行清空所有 Docker 资源的命令。
+
+日常查看：
+
+```sh
+cd /home/ubuntu/tingjian-file-reader-staging
+sudo docker compose --env-file .env.staging --project-name tingjian-reader-staging ps
+curl --fail https://read.tinsmartfm.com/api/health
+```
+
+升级时先从 GitHub 拉取经过 CI 的确切提交，在此独立环境验收。保留数据库和音频卷。当前没有自动部署主分支的监听，不会因其他业务仓库发布而更新本工具。

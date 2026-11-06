@@ -1,5 +1,7 @@
 # 听见文件
 
+独立验收网址：[read.tinsmartfm.com](https://read.tinsmartfm.com)。访问需管理员提供口令。源码在功能分支，见 [PR #1](https://github.com/Tingtinggogogo/tingjian-file-reader/pull/1)；运行与验收记录见 [交付状态](docs/LOCAL-VERIFICATION.md)。
+
 手机优先的中文文件朗读工具。蓝色 `#0058A3` 与黄色 `#FFDB00`，静态资源随服务器托管，无字体/CDN/Google 前端依赖。目标为约 50 位受邀使用者；不是 50 路并发语音服务。
 
 ## 功能与边界
