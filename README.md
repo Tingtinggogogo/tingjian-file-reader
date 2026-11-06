@@ -6,9 +6,9 @@
 
 ## 功能与边界
 
-- 上传 PDF、DOCX、XLSX、PPTX、TXT、MD、CSV、JSON、LOG、PNG、JPG/JPEG、WEBP；自动提取文字。
+- 上传 EPUB、MOBI、PDF、DOCX、XLSX、PPTX、TXT、MD、CSV、JSON、LOG、PNG、JPG/JPEG、WEBP；自动提取文字。
 - 图片使用服务器本地 Tesseract 中文 OCR；扫描 PDF 请先转图片。暂不读取旧版 DOC/XLS/PPT、压缩包、音视频、程序及加密文件；不宣称可读任意格式。
-- 单文件 20 MB；提取最多 30,000 字；PDF 最多 100 页；图片最多 1600 万像素；Office 解压上限 80 MiB、3000 条目。
+- 单文件 20 MB；提取最多 30,000 字；PDF 最多 100 页；图片最多 1600 万像素；Office/EPUB 解压上限 80 MiB、3000 条目；电子书正文最多 30,000 字，长书请先拆分。
 - 页面只有选文件、生成朗读及下方历史。固定 Edge-TTS 晓晓自然女声、舒缓语速；点击生成前有明确微软文字发送说明。API 不接受其他音色/引擎/语速参数。
 - 音频排队生成、状态轮询、播放器、音频下载；最多 20 个待处理任务，每会话每小时 10 次，全站 100 次/小时、500 次/日；上传全站 120 次/小时，草稿写入全站 600 次/小时。
 - 提取内容在本机保存 + 服务器同步；断网提示。客户端本机存储受设备和浏览器设置影响，原文件本身不保存草稿。
@@ -20,7 +20,7 @@
 
 本机依赖已安装后，可双击 `本机预览.command`。终端会显示本机地址，无需口令；设置保存在被 Git 忽略的 `data/local-settings.json`。仅监听本机，不作为公网配置。
 
-需要 Python 3.13；当前用户流程使用微软在线语音，需要联网。eSpeak NG/系统婷婷仅保留用于旧版任务兼容与离线升级测试，不出现在用户页面。图片需要 Tesseract 的 chi_sim/eng 语言包。Docker 镜像包含这些系统依赖。
+需要 Python 3.13；当前用户流程使用微软在线语音，需要联网。eSpeak NG/系统婷婷仅保留用于旧版任务兼容与离线升级测试，不出现在用户页面。MOBI 需要 libmobi-tools 提供的 mobitool（Linux 可使用发行版软件包，macOS 可通过 Homebrew 安装 libmobi）；EPUB 使用安全 XML 与 HTML 文本解析。图片需要 Tesseract 的 chi_sim/eng 语言包。Docker 镜像包含这些系统依赖。
 
 ```sh
 python3 -m venv .venv
@@ -42,9 +42,11 @@ export ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
 node --check app/static/app.js
 ```
 
-20 项回归覆盖匿名身份续期/防伪、来源校验、草稿/音频隔离、安全提取、大小限制、晓晓固定参数与发送确认、排队、全站额度、存储限制、30 天历史与分页、兼容迁移和旧版离线任务。CI 使用 PostgreSQL，检查本地资源护栏、依赖漏洞和 JavaScript 语法，并构建 Docker 镜像。
+34 项回归覆盖匿名身份续期/防伪、来源校验、草稿/音频隔离、安全提取、大小限制、晓晓固定参数与发送确认、排队、全站额度、存储限制、30 天历史与分页、兼容迁移和旧版离线任务；新增 EPUB 章节顺序/路径/实体/DRM/体积验证及 MOBI 真实解码、压缩、上传和超时清理。CI 必须安装真实 mobitool，不能跳过 MOBI 测试。CI 使用 PostgreSQL，检查本地资源护栏、依赖漏洞和 JavaScript 语法，并构建 Docker 镜像。
 
 ## 交付与运维
+
+电子书具体支持范围见 [电子书说明](docs/EBOOKS.md)。
 
 见 [部署说明](docs/DEPLOYMENT.md)、[语音与大陆访问说明](docs/TTS.md)、[验收清单](docs/ACCEPTANCE.md)。代码在 `feat/file-reader` 分支开发，通过 PR 审核；`test-and-build` 成功与 staging 真机验收完成后才可考虑合并，不能从运行中的容器提取源码。CI 不含服务器密钥、生产部署或自动合并。新建公开仓库的初始 `main` 只放仓库说明；业务代码通过功能分支 PR 引入。
 

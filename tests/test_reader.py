@@ -281,3 +281,92 @@ def test_20_storage_and_upload_budgets(client, monkeypatch):
         db.execute(text('INSERT INTO usage_limits(bucket,count,created) VALUES(:b,120,:t)'),
                    {'b': f'uploads-hour:{int(time.time() // 3600)}', 't': time.time()})
     assert client.post('/api/extract', files={'file': ('test.txt', '你好'.encode())}).status_code == 429
+
+
+def test_21_epub_reading_order_and_safe_html(client):
+    from ebook_samples import epub_sample
+    data = epub_sample()
+    result = extract(data, '书籍.EPUB')
+    assert result == '第一章\n你好，世界。\n第二章：晚安。'
+    assert client.post('/api/extract', files={'file': ('中文.epub', data, 'application/epub+zip')}).json()['content'] == result
+    session = client.post('/api/session', json={}).json()
+    assert {'.epub', '.mobi'}.issubset(session['extensions'])
+
+
+@pytest.mark.parametrize('kind', ['drm', 'traversal', 'remote', 'xml-entity', 'missing', 'oversized', 'empty', 'invalid'])
+def test_22_epub_rejects_unreadable_or_unsafe_books(kind):
+    from ebook_samples import epub_sample
+    extra, chapters = {}, None
+    if kind == 'drm':
+        extra['META-INF/encryption.xml'] = '<encryption><EncryptedData><CipherData><CipherReference URI="Books/first.xhtml"/></CipherData></EncryptedData></encryption>'
+    elif kind == 'traversal':
+        chapters = {'../../outside.xhtml': '<p>拒绝越界</p>'}
+    elif kind == 'remote':
+        chapters = {'https://example.invalid/private.xhtml': '<p>不访问网络</p>'}
+    elif kind == 'xml-entity':
+        extra['META-INF/container.xml'] = '<!DOCTYPE container [<!ENTITY x SYSTEM "file:///etc/passwd">]><container>&x;</container>'
+    elif kind == 'missing':
+        extra['Books/package.opf'] = '<package><manifest/><spine><itemref idref="missing"/></spine></package>'
+    elif kind == 'oversized':
+        chapters = {'long.xhtml': '<p>' + '中' * 30001 + '</p>'}
+    elif kind == 'empty':
+        chapters = {'image.xhtml': '<html><body><img src="cover.png"/></body></html>'}
+    elif kind == 'invalid':
+        with pytest.raises(ValueError, match='损坏'):
+            extract(b'not a zip', 'fake.epub')
+        return
+    with pytest.raises(ValueError):
+        extract(epub_sample(chapters=chapters, extra=extra), 'bad.epub')
+
+
+def test_23_epub_obfuscated_fonts_and_archive_limits():
+    from ebook_samples import epub_sample
+    font = {'META-INF/encryption.xml': '<encryption><EncryptedData><CipherData><CipherReference URI="Books/font.otf"/></CipherData></EncryptedData></encryption>'}
+    assert '第一章' in extract(epub_sample(extra=font), 'font.epub')
+    with pytest.raises(ValueError, match='解压后过大'):
+        extract(epub_sample(extra={f'padding/{i}': '' for i in range(3001)}), 'many.epub')
+
+
+@pytest.mark.parametrize('compressed', [False, True])
+def test_24_mobi_actual_decoder_and_upload(client, compressed):
+    import shutil
+    from ebook_samples import mobi_sample
+    if not shutil.which('mobitool'):
+        if os.environ.get('CI'):
+            pytest.fail('CI must install libmobi-tools for real MOBI verification')
+        pytest.skip('Local MOBI test requires mobitool; required in CI')
+    data = mobi_sample(compressed=compressed)
+    result = extract(data, 'book.mobi')
+    assert result == '第一章\n你好，欢迎使用听见文件。\n第二章，晚安。'
+    response = client.post('/api/extract', files={'file': ('中文.mobi', data, 'application/x-mobipocket-ebook')})
+    assert response.status_code == 200 and response.json()['content'] == result
+
+
+def test_25_mobi_drm_corruption_and_expansion_limit(client):
+    import struct
+    from ebook_samples import mobi_sample
+    with pytest.raises(ValueError, match='DRM'):
+        extract(mobi_sample(encrypted=True), 'locked.mobi')
+    with pytest.raises(ValueError, match='格式不符'):
+        extract(b'fake mobi', 'fake.mobi')
+    data = bytearray(mobi_sample()); header = struct.unpack_from('>I', data, 78)[0]
+    struct.pack_into('>I', data, header + 4, 80 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError, match='解压后过大'):
+        extract(bytes(data), 'bomb.mobi')
+    struct.pack_into('>I', data, 78, 0)
+    with pytest.raises(ValueError, match='损坏'):
+        extract(bytes(data), 'broken.mobi')
+    response = client.post('/api/extract', files={'file': ('locked.mobi', mobi_sample(encrypted=True))})
+    assert response.status_code == 422 and 'DRM' in response.json()['detail']
+
+
+def test_26_mobi_timeout_cleans_temporary_files(tmp_path, monkeypatch):
+    from app import ebooks
+    from ebook_samples import mobi_sample
+    def timeout(*args, **kwargs):
+        raise ebooks.subprocess.TimeoutExpired('mobitool', 45)
+    monkeypatch.setattr(ebooks.shutil, 'which', lambda name: '/test/mobitool')
+    monkeypatch.setattr(ebooks.subprocess, 'run', timeout)
+    with pytest.raises(ValueError, match='超时'):
+        extract(mobi_sample(), 'timeout.mobi', tmp_path)
+    assert list(tmp_path.iterdir()) == []

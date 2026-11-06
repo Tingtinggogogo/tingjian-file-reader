@@ -5,14 +5,14 @@ import zipfile
 from pathlib import Path
 from PIL import Image
 
-SUPPORTED = {'.txt', '.md', '.csv', '.json', '.log', '.pdf', '.docx', '.xlsx', '.pptx', '.png', '.jpg', '.jpeg', '.webp'}
+SUPPORTED = {'.epub', '.mobi', '.txt', '.md', '.csv', '.json', '.log', '.pdf', '.docx', '.xlsx', '.pptx', '.png', '.jpg', '.jpeg', '.webp'}
 MAX_TEXT = 30000
 
 
-def extract(data: bytes, filename: str) -> str:
+def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
     ext = Path(filename).suffix.lower()
     if ext not in SUPPORTED:
-        raise ValueError('暂不支持此类型。请转换为 PDF、DOCX、TXT、XLSX、PPTX 或图片。')
+        raise ValueError('暂不支持此类型。请转换为 EPUB、MOBI、PDF、DOCX、TXT、XLSX、PPTX 或图片。')
     if ext in {'.docx', '.xlsx', '.pptx'}:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             entries = archive.infolist()
@@ -20,7 +20,10 @@ def extract(data: bytes, filename: str) -> str:
                 raise ValueError('文档解压后过大，请拆分文件。')
             if any(x.flag_bits & 1 for x in entries):
                 raise ValueError('不支持加密文档。')
-    if ext == '.pdf':
+    if ext in {'.epub', '.mobi'}:
+        from app.ebooks import epub_text, mobi_text
+        text = epub_text(data) if ext == '.epub' else mobi_text(data, temp_parent)
+    elif ext == '.pdf':
         from pypdf import PdfReader
         if not data.startswith(b'%PDF-'):
             raise ValueError('文件内容与 PDF 格式不符。')

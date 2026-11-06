@@ -10,7 +10,7 @@
 
 ## 源码与分支
 
-唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、20 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
+唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、34 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
 
 ## 环境准备
 
@@ -87,3 +87,9 @@ curl --fail https://read.tinsmartfm.com/api/health
 启动新增 jobs.title（旧值为“文件朗读”）及 usage_limits 表。用量计数只存时间桶/次数，不存 IP 或文件内容，保留约两天；历史文字和音频保留 30 天，草稿 24 小时。音频达到 5 GiB 或磁盘不足 1 GiB 时拒绝新增任务；单个运行中任务可能越过容量阈值少量空间。
 
 获取 CI 成功的确切 GitHub 提交，保留所有卷，重建 app；对本项目 web 执行 nginx -t 后 nginx -s reload，移除旧登录限流配置并刷新应用地址解析。其他业务容器不改动。回滚旧提交重建时可继续使用旧环境中口令；数据库新增字段保留。
+
+## EPUB / MOBI 更新
+
+镜像新增发行版 `libmobi-tools` 软件包，Python 显式依赖 defusedxml。CI 也安装 mobitool 并进行真实 MOBI 解码测试。部署前镜像必须构建成功；只更新独立 reader app，无数据库迁移，无需修改其他服务或公网路由。
+
+MOBI 子进程限制 45 秒墙钟时间、40 秒 CPU、256 MiB 地址空间（Linux）和 80 MiB 单输出文件；不能传入解密密钥。临时转换目录位于该次上传目录，成功/失败均清理。EPUB 不释放 ZIP 文件到磁盘，只按 spine 阅读安全路径里的正文，不加载外部资源。原有 20 MB/30,000 字限制不变。详见 EBOOKS.md。

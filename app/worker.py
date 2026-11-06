@@ -8,7 +8,7 @@ if __name__ == '__main__':
     mode, source, target, *args = sys.argv[1:]
     if mode == 'extract':
         try:
-            Path(target).write_text(extract(Path(source).read_bytes(), args[0]), encoding='utf-8')
+            Path(target).write_text(extract(Path(source).read_bytes(), args[0], Path(source).parent), encoding='utf-8')
         except ValueError as exc:
             Path(target + '.error').write_text(str(exc), encoding='utf-8')
             sys.exit(2)
