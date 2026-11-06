@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#0058a3"><title>听见文件 · 把文字交给耳朵</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/" aria-label="听见文件首页"><span class="mark">听</span>听见文件<span class="tag">文件朗读工具</span></a><span class="private">专属小工具</span></header>
+<main>
+<section class="intro"><p class="eyebrow">READ LESS. LISTEN MORE.</p><h1>文件放进来，<br><span>让耳朵接着读。</span></h1><p>文档、表格、图片里的文字，变成可以随时听的声音。</p></section>
+<div id="network" class="notice" role="status" hidden>网络已断开。文字会保存在本机，联网后再同步。</div>
+<div id="message" role="status" aria-live="polite"></div>
+<section id="login" class="card"><div class="step">欢迎回来</div><h2>输入口令，开始听文件</h2><p>仅限受邀使用。口令由工具管理员提供。</p><form id="login-form"><label for="code">访问口令</label><div class="login-row"><input id="code" type="password" autocomplete="current-password" required maxlength="128" placeholder="请输入访问口令"><button type="submit">进入工具 <span aria-hidden="true">→</span></button></div></form></section>
+<div id="workspace" hidden>
+<div class="layout"><section class="card editor"><div class="section-head"><div><div class="step">01 / 准备内容</div><h2>今天想听点什么？</h2></div><span class="badge">最大 20 MB</span></div>
+<label class="drop" for="file"><span class="upload-icon" aria-hidden="true">↑</span><strong>点这里，选择一个文件</strong><span>手机文件、相册中的图片都可以</span><input id="file" type="file"><span class="formats">PDF · Word · Excel · PPT · TXT · 图片</span></label>
+<p class="hint">支持 PDF、DOCX、XLSX、PPTX、TXT、MD、CSV、JSON、LOG、PNG、JPG、WEBP。旧版 Office、压缩包、程序、音视频暂不支持；扫描 PDF 请先转为图片。</p>
+<div class="text-head"><label for="content">朗读内容 <span id="filename"></span></label><span id="save-state" aria-live="polite">草稿自动保存</span></div><textarea id="content" maxlength="30000" placeholder="上传后，文字会出现在这里。也可以直接粘贴文字，调整后再朗读。" rows="12"></textarea><div class="text-footer"><span>识别结果可能有误，朗读前可编辑校对</span><span id="count">0 / 30,000</span></div>
+</section>
+<aside><section class="card controls"><div class="step">02 / 生成声音</div><h2>选好声音，开始听</h2><label for="provider">朗读方式</label><select id="provider"><option value="offline">服务器离线朗读 · 无需外部服务</option><option id="edge-option" value="edge" disabled>微软在线朗读 · 尚未启用</option></select><p id="provider-note" class="hint">离线语音采用 eSpeak NG，音色较机械。文字不会发往外部语音服务；生成的音频通过服务器传给你。</p>
+<label id="consent-row" class="check" hidden><input id="consent" type="checkbox">我同意将朗读文字发送至微软在线语音服务；不会上传敏感或保密内容。</label>
+<label for="voice">在线音色</label><select id="voice" disabled><option value="female">晓晓 · 女声</option><option value="male">云希 · 男声</option></select><p class="hint">离线模式使用固定中文音色。</p>
+<button id="generate" class="primary">生成朗读 <span aria-hidden="true">↗</span></button><p class="hint">最多 30,000 字；每小时最多 10 次。生成后点播放即可听，锁屏播放取决于设备。</p></section>
+<section class="privacy"><span aria-hidden="true">◈</span><div><strong>你的内容，你来决定</strong><p>原文件在提取结束后删除。文字与音频保留约 24 小时，也可以主动清除。本机草稿会留存至你清除或退出。</p></div></section></aside></div>
+<section class="card library"><div class="section-head"><div><div class="step">03 / 收听与下载</div><h2>我的朗读</h2></div><button id="refresh" class="secondary">刷新列表</button></div><div id="jobs"><p class="empty">还没有朗读。上传第一份文件，让文字变成声音。</p></div></section>
+<div class="actions"><button id="clear" class="text-button">清除我的文字与音频</button><button id="logout" class="text-button">退出并清除本机草稿</button></div>
+</div>
+<footer><strong>听见文件</strong><span>给眼睛休息的时间，给文字另一种打开方式。</span><small>无需安装 · 中文朗读 · 手机优先</small></footer>
+</main></body></html>
