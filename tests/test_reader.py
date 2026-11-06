@@ -186,3 +186,59 @@ def test_14_offline_real_synthesis_or_error_reporting(client, monkeypatch):
             assert job['error']
     finally:
         main.STOP.set(); thread.join(3)
+
+
+def test_15_natural_voice_rate_metadata_and_preview_privacy(client, monkeypatch):
+    monkeypatch.setattr(main, 'EDGE_ENABLED', True)
+    client.put('/api/draft', json={'content': '不应该发送的私人草稿'})
+    assert client.post('/api/speech', json={'content': '你好', 'provider': 'edge', 'consent': False}).status_code == 422
+    for voice in ('female', 'xiaoyi', 'male'):
+        result = client.post('/api/preview', json={'voice': voice, 'rate': 'slow', 'content': '不应该发送的额外内容'})
+        assert result.status_code == 202
+        with main.DB.connect() as db:
+            job = db.execute(text('SELECT * FROM jobs WHERE id=:id'), result.json()).mappings().one()
+            assert job['content'] == main.PREVIEW_TEXT
+            assert (job['voice'], job['rate'], job['kind']) == (voice, 'slow', 'preview')
+    assert client.get('/api/draft').json()['content'] == '不应该发送的私人草稿'
+    assert client.get('/api/jobs').json()[0]['kind'] == 'preview'
+    assert client.post('/api/preview', json={'voice': 'invalid'}).status_code == 422
+    assert client.post('/api/preview', json={'rate': '+999%'}).status_code == 422
+    assert TestClient(main.app, headers={'Origin': 'http://testserver'}).post('/api/preview', json={}).status_code == 401
+    monkeypatch.setattr(main, 'EDGE_ENABLED', False)
+    assert client.post('/api/preview', json={}).status_code == 422
+
+
+def test_16_additive_migration_preserves_existing_jobs_and_drafts(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    database = create_engine('sqlite:///' + str(tmp_path / 'legacy.db'))
+    monkeypatch.setattr(main, 'DB', database)
+    with database.begin() as db:
+        for statement in main.SCHEMA:
+            db.execute(text(statement))
+        db.execute(text("INSERT INTO jobs VALUES ('legacy','owner','旧文字','female','offline','done','',1)"))
+        db.execute(text("INSERT INTO drafts VALUES ('owner','保留草稿',1)"))
+    main.initialize(); main.initialize()
+    with database.connect() as db:
+        row = db.execute(text('SELECT * FROM jobs')).mappings().one()
+        assert (row['content'], row['status'], row['rate'], row['kind']) == ('旧文字', 'done', 'normal', 'reading')
+        assert db.execute(text('SELECT content FROM drafts')).scalar() == '保留草稿'
+    database.dispose()
+
+
+def test_17_edge_voice_and_rate_forwarded_without_text_fragmentation(tmp_path, monkeypatch):
+    import edge_tts
+    from app.tts import synthesize
+    calls = []
+    class FakeSpeech:
+        def __init__(self, content, voice, *, rate):
+            calls.append((content, voice, rate))
+        async def save(self, target):
+            Path(target).write_bytes(b'mock-audio')
+    monkeypatch.setattr(edge_tts, 'Communicate', FakeSpeech)
+    content = '你好，欢迎使用。我们慢慢来。'
+    for voice, expected in [('female', 'zh-CN-XiaoxiaoNeural'), ('xiaoyi', 'zh-CN-XiaoyiNeural'), ('male', 'zh-CN-YunxiNeural')]:
+        synthesize(content, voice, 'edge', tmp_path / 'test.mp3', 'slow')
+        assert calls[-1] == (content, expected, '-15%')
+    assert len(calls) == 3
+    with pytest.raises(ValueError):
+        synthesize(content, 'female', 'edge', tmp_path / 'test.mp3', 'invalid')

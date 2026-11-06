@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 DATA = Path(os.getenv('DATA_DIR', 'data')).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
@@ -47,6 +47,11 @@ def initialize():
     with DB.begin() as db:
         for statement in SCHEMA:
             db.execute(text(statement))
+        # Additive migration preserves drafts, queued work, and existing audio.
+        columns = {column['name'] for column in inspect(db).get_columns('jobs')}
+        for column, default in (('rate', 'normal'), ('kind', 'reading')):
+            if column not in columns:
+                db.execute(text(f"ALTER TABLE jobs ADD COLUMN {column} VARCHAR(16) NOT NULL DEFAULT '{default}'"))
         # One application process only; recover interrupted tasks after restart.
         db.execute(text("UPDATE jobs SET status='queued' WHERE status='processing'"))
 
@@ -84,11 +89,11 @@ def work():
             try:
                 source.write_text(job['content'], encoding='utf-8')
                 subprocess.run([sys.executable, '-m', 'app.worker', 'tts', str(source), str(target),
-                                job['voice'], job['provider']], timeout=200, check=True, capture_output=True)
+                                job['voice'], job['provider'], job['rate']], timeout=200, check=True, capture_output=True)
                 status, error = 'done', ''
             except Exception:
                 target.unlink(missing_ok=True)
-                status, error = 'failed', '语音生成失败或超时，请重试；在线引擎失败时可改用离线引擎。'
+                status, error = 'failed', ('微软在线语音暂时不可用或生成超时，请稍后重试。未自动改用机械离线音色。' if job['provider'] == 'edge' else '离线语音生成失败或超时，请重试。')
             finally:
                 source.unlink(missing_ok=True)
             with DB.begin() as db:
@@ -146,10 +151,17 @@ class Content(BaseModel):
     content: str = Field(max_length=30000)
 
 
-class Speech(Content):
-    voice: Literal['female', 'male'] = 'female'
+class VoiceSettings(BaseModel):
+    voice: Literal['female', 'xiaoyi', 'male'] = 'female'
+    rate: Literal['slow', 'normal', 'fast'] = 'normal'
+
+
+class Speech(Content, VoiceSettings):
     provider: Literal['offline', 'edge'] = 'offline'
     consent: bool = False
+
+
+PREVIEW_TEXT = '你好，欢迎使用听见文件。让眼睛休息一下，我们慢慢来，把文字读给你听。'
 
 
 @app.get('/api/health')
@@ -254,6 +266,17 @@ def upload(request: Request, file: UploadFile = File(...)):
 
 @app.post('/api/speech', status_code=202)
 def speech(body: Speech, request: Request):
+    return enqueue(body, request)
+
+
+@app.post('/api/preview', status_code=202)
+def preview(body: VoiceSettings, request: Request):
+    # Only this public sample is submitted; never read the user's draft.
+    return enqueue(Speech(content=PREVIEW_TEXT, voice=body.voice, rate=body.rate,
+                          provider='edge', consent=True), request, kind='preview')
+
+
+def enqueue(body: Speech, request: Request, kind='reading'):
     who = owner(request)
     if not body.content.strip():
         raise HTTPException(422, '请先上传文件或输入文字。')
@@ -268,9 +291,10 @@ def speech(body: Speech, request: Request):
         count = db.execute(text('SELECT COUNT(*) FROM jobs WHERE owner=:o AND created>:t'), {'o': who, 't': time.time() - 3600}).scalar()
         if pending >= 20 or count >= 10:
             raise HTTPException(429, '队列已满或已达到每小时 10 次限制，请稍后再试。')
-        db.execute(text('''INSERT INTO jobs(id,owner,content,voice,provider,status,error,created)
-        VALUES(:id,:o,:c,:v,:p,'queued','',:t)'''),
-                   {'id': job, 'o': who, 'c': body.content.strip(), 'v': body.voice, 'p': body.provider, 't': time.time()})
+        db.execute(text('''INSERT INTO jobs(id,owner,content,voice,provider,rate,kind,status,error,created)
+        VALUES(:id,:o,:c,:v,:p,:r,:k,'queued','',:t)'''),
+                   {'id': job, 'o': who, 'c': body.content.strip(), 'v': body.voice, 'p': body.provider,
+                    'r': body.rate, 'k': kind, 't': time.time()})
     return {'id': job, 'status': 'queued'}
 
 
@@ -278,7 +302,7 @@ def speech(body: Speech, request: Request):
 def jobs(request: Request):
     who = owner(request)
     with DB.connect() as db:
-        rows = db.execute(text('SELECT id,status,error,provider,created FROM jobs WHERE owner=:o ORDER BY created DESC LIMIT 20'), {'o': who}).mappings().all()
+        rows = db.execute(text('SELECT id,status,error,provider,voice,rate,kind,created FROM jobs WHERE owner=:o ORDER BY created DESC LIMIT 20'), {'o': who}).mappings().all()
     return [dict(row) for row in rows]
 
 

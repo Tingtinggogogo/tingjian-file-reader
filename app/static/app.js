@@ -2,6 +2,8 @@
 const $ = id => document.getElementById(id);
 let syncTimer, pollTimer, busy = false, restored = false, nativeMac = false;
 const offlineNote = () => nativeMac ? '本机预览使用 macOS 已安装的婷婷中文音色。腾讯云 Linux 部署使用 eSpeak NG，音色会有所不同。' : '离线语音采用 eSpeak NG，音色较机械。文字不会发往外部语音服务；生成的音频通过服务器传给你。';
+const VOICE_LABELS = { female: '晓晓 · 女声', xiaoyi: '晓伊 · 女声', male: '云希 · 男声' };
+const RATE_LABELS = { slow: '舒缓', normal: '标准', fast: '稍快' };
 const DRAFT_KEY = 'reader-draft-v1';
 let syncChain = Promise.resolve();
 const message = text => { $('message').textContent = text; };
@@ -38,9 +40,10 @@ function changed() {
 async function enter() {
   const session = await api('/session');
   $('login').hidden = true; $('workspace').hidden = false;
-  nativeMac = session.native_mac; $('provider-note').textContent = offlineNote();
+  nativeMac = session.native_mac;
   $('edge-option').disabled = !session.edge_enabled;
-  $('edge-option').textContent = session.edge_enabled ? '微软在线朗读 · 需要外网' : '微软在线朗读 · 尚未启用';
+  $('edge-option').textContent = session.edge_enabled ? '微软自然语音 · 推荐' : '微软在线朗读 · 尚未启用';
+  $('provider').value = session.edge_enabled ? 'edge' : 'offline'; updateProvider();
   $('file').accept = session.extensions.join(',');
   const server = await api('/draft');
   const local = localRead();
@@ -68,10 +71,22 @@ $('file').addEventListener('change', async () => {
   } catch (e) { message(e.message); }
   finally { $('file').disabled = false; $('generate').disabled = false; busy = false; $('file').value = ''; }
 });
-$('provider').addEventListener('change', () => {
+function updateProvider() {
   const online = $('provider').value === 'edge'; $('consent-row').hidden = !online; $('voice').disabled = !online;
   $('provider-note').textContent = online ? 'Edge-TTS 依赖外部微软服务，文字会发送至微软。中国大陆访问可能不稳定，服务可能中断；请勿上传保密资料。' : offlineNote();
+  $('preview-panel').hidden = !online;
+  $('voice-note').textContent = online ? '先听一小段再选。想听得轻缓一些，可以搭配“舒缓”语速。' : '离线模式使用固定机械音色，不支持男女声切换。';
   $('consent').checked = false;
+}
+$('provider').addEventListener('change', updateProvider);
+$('preview').addEventListener('click', async () => {
+  if (busy) return;
+  busy = true; $('preview').disabled = true; $('generate').disabled = true;
+  try {
+    await api('/preview', json('POST', { voice: $('voice').value, rate: $('rate').value }));
+    message('试听已加入队列，仅使用固定示例。生成后请在“我的朗读”中播放标有“试听”的音频。'); await refresh();
+  } catch (e) { message(e.message); }
+  finally { busy = false; $('preview').disabled = false; $('generate').disabled = false; }
 });
 $('generate').addEventListener('click', async () => {
   if (busy) return;
@@ -79,7 +94,7 @@ $('generate').addEventListener('click', async () => {
   if ($('provider').value === 'edge' && !$('consent').checked) { message('使用微软在线语音前，请先确认文字发送授权。'); return; }
   busy = true; $('generate').disabled = true;
   try {
-    await api('/speech', json('POST', { content: $('content').value, voice: $('voice').value, provider: $('provider').value, consent: $('consent').checked }));
+    await api('/speech', json('POST', { content: $('content').value, voice: $('voice').value, provider: $('provider').value, rate: $('rate').value, consent: $('consent').checked }));
     message('已加入朗读队列。生成完成后，在“我的朗读”中点击播放。'); await refresh();
   } catch (e) { message(e.message); } finally { busy = false; $('generate').disabled = false; }
 });
@@ -95,7 +110,7 @@ async function refresh() {
       if (node && node.dataset.status === job.status) { existing.delete(job.id); continue; }
       const replacement = document.createElement('article'); replacement.className = 'job'; replacement.dataset.id = job.id; replacement.dataset.status = job.status;
       const top = document.createElement('div'); top.className = 'job-top';
-      const label = document.createElement('strong'); label.textContent = new Date(job.created * 1000).toLocaleString('zh-CN', { hour12: false }) + ' · ' + (job.provider === 'edge' ? '微软在线' : '离线中文');
+      const label = document.createElement('strong'); label.textContent = new Date(job.created * 1000).toLocaleString('zh-CN', { hour12: false }) + ' · ' + (job.kind === 'preview' ? '试听 · ' : '') + (job.provider === 'edge' ? (VOICE_LABELS[job.voice] || '微软在线') : '离线机械音色') + ' · ' + (RATE_LABELS[job.rate] || '标准');
       const status = document.createElement('span'); status.textContent = ({ queued: '等待中', processing: '生成中…', done: '可以收听', failed: '生成失败' })[job.status]; top.append(label, status); replacement.append(top);
       if (job.status === 'done') {
         const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'none'; audio.src = '/api/audio/' + job.id;

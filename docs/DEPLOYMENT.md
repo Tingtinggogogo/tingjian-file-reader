@@ -10,7 +10,7 @@
 
 ## 源码与分支
 
-唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、14 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
+唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、17 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
 
 ## 环境准备
 
@@ -74,3 +74,9 @@ curl --fail https://read.tinsmartfm.com/api/health
 ```
 
 升级时先从 GitHub 拉取经过 CI 的确切提交，在此独立环境验收。保留数据库和音频卷。当前没有自动部署主分支的监听，不会因其他业务仓库发布而更新本工具。
+
+## 自然语音更新
+
+仅在独立 reader staging 中设置 `ENABLE_EDGE_TTS=true`，重建 app 容器；数据库、音频卷及共享入口保持原样。先确认无 queued/processing 作业，再从 GitHub 获取通过 CI 的功能分支提交。不要修改 waste-web-production。启动时只给 jobs 增加 rate/kind 列，旧作业默认 normal/reading，保留草稿和录音。回滚到旧代码时无需删列，可恢复原配置关闭在线语音。
+
+上线前从首尔用固定公共短句实测三种音色；成功不代表中国大陆所有网络均可访问。不得用现有用户文件测试外部服务。

@@ -13,4 +13,4 @@ if __name__ == '__main__':
             Path(target + '.error').write_text(str(exc), encoding='utf-8')
             sys.exit(2)
     else:
-        synthesize(Path(source).read_text(encoding='utf-8'), args[0], args[1], Path(target))
+        synthesize(Path(source).read_text(encoding='utf-8'), args[0], args[1], Path(target), args[2] if len(args) > 2 else 'normal')
