@@ -1,0 +1,52 @@
+name: test-and-build
+on:
+  pull_request:
+  push:
+    branches: ['feat/**']
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: reader_test
+          POSTGRES_USER: reader
+          POSTGRES_PASSWORD: ci-only-test-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U reader -d reader_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://reader:ci-only-test-password@localhost:5432/reader_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install ebook decoder, offline speech and OCR
+        timeout-minutes: 5
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmobi-tools espeak-ng tesseract-ocr tesseract-ocr-chi-sim
+      - run: pip install -r requirements-dev.txt
+      - run: python scripts/guardrails.py
+      - run: pip-audit -r requirements.txt
+      - run: python -m pytest -q
+      - run: node --check app/static/app.js
+      - name: Validate independent staging configuration
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          SESSION_SECRET: ci-only-secret-at-least-32-characters
+          ALLOWED_ORIGINS: https://staging.example.invalid
+          APP_PORT: '18081'
+        run: docker compose --project-name reader-staging config --quiet
+      - name: Build release Docker image (no push or deployment)
+        run: docker build -t tingjian-file-reader:ci .

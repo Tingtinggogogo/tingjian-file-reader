@@ -1,0 +1,9 @@
+# Insert into an inspected, existing HTTPS server block ONLY after acceptance.
+# This example assumes the tool owns the domain root; do not overwrite an existing site.
+location / {
+    client_max_body_size 21m;
+    proxy_pass http://127.0.0.1:18080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 220s;
+}
