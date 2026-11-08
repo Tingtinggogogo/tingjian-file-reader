@@ -13,8 +13,8 @@ from urllib.parse import unquote, urlsplit
 
 from defusedxml import ElementTree as ET
 
-MAX_EXPANDED = 80 * 1024 * 1024
-MAX_TEXT = 30000
+MAX_EXPANDED = 256 * 1024 * 1024
+MAX_TEXT = 300000
 
 
 def member_path(base: str, href: str) -> str:
@@ -35,12 +35,9 @@ class ChapterText(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.stack, self.chunks, self.size = [], [], 0
+        self.stack, self.chunks = [], []
 
     def add(self, value):
-        self.size += len(value)
-        if self.size > MAX_TEXT:
-            raise ValueError('提取文字超过 30000 字，请拆分电子书。')
         self.chunks.append(value)
 
     def handle_starttag(self, tag, attrs):
@@ -86,9 +83,13 @@ def chapter_text(raw: bytes) -> str:
     return '\n'.join(line.strip() for line in ''.join(parser.chunks).splitlines() if line.strip())
 
 
-def epub_text(data: bytes) -> str:
+def epub_text(data: bytes | Path) -> str:
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as book:
+        with zipfile.ZipFile(data if isinstance(data, Path) else io.BytesIO(data)) as book:
+            def read_member(name):
+                if book.getinfo(name).file_size > 8 * 1024 * 1024:
+                    raise ValueError('单个电子书章节过大，请重新划分章节。')
+                return book.read(name)
             entries = book.infolist()
             names = [entry.filename for entry in entries]
             if len(entries) > 3000 or sum(entry.file_size for entry in entries) > MAX_EXPANDED:
@@ -97,19 +98,19 @@ def epub_text(data: bytes) -> str:
                 raise ValueError('电子书包含重复文件路径。')
             if any(entry.flag_bits & 1 for entry in entries):
                 raise ValueError('不支持加密或 DRM 保护的电子书。')
-            if book.read('mimetype').strip() != b'application/epub+zip':
+            if read_member('mimetype').strip() != b'application/epub+zip':
                 raise ValueError('文件内容与 EPUB 格式不符。')
-            container = ET.fromstring(book.read('META-INF/container.xml'))
+            container = ET.fromstring(read_member('META-INF/container.xml'))
             rootfile = container.find('.//{*}rootfile')
             if rootfile is None:
                 raise ValueError('EPUB 缺少章节目录。')
             package_path = member_path('', rootfile.get('full-path', ''))
-            package = ET.fromstring(book.read(package_path))
+            package = ET.fromstring(read_member(package_path))
             base = posixpath.dirname(package_path)
             manifest = {item.get('id'): item for item in package.findall('./{*}manifest/{*}item')}
             encrypted = set()
             if 'META-INF/encryption.xml' in names:
-                for ref in ET.fromstring(book.read('META-INF/encryption.xml')).findall('.//{*}CipherReference'):
+                for ref in ET.fromstring(read_member('META-INF/encryption.xml')).findall('.//{*}CipherReference'):
                     encrypted.add(member_path('', ref.get('URI', '')))
             chunks, size = [], 0
             spine = package.findall('./{*}spine/{*}itemref')
@@ -124,12 +125,13 @@ def epub_text(data: bytes) -> str:
                 path = member_path(base, item.get('href', ''))
                 if path in encrypted:
                     raise ValueError('不支持加密或 DRM 保护的电子书。')
-                chunk = chapter_text(book.read(path))
+                chunk = chapter_text(read_member(path))
+                if not chunk:
+                    continue
                 size += len(chunk) + (1 if chunks else 0)
                 if size > MAX_TEXT:
-                    raise ValueError('提取文字超过 30000 字，请拆分电子书。')
-                if chunk:
-                    chunks.append(chunk)
+                    raise ValueError('提取文字超过 30 万字，请拆分电子书。')
+                chunks.append(chunk)
             result = '\n'.join(chunks)
             if not result:
                 raise ValueError('电子书没有可提取的正文文字，纯图片电子书暂不支持。')
@@ -140,22 +142,27 @@ def epub_text(data: bytes) -> str:
         raise ValueError('EPUB 已损坏或章节目录无效，请重新导出后上传。') from exc
 
 
-def mobi_text(data: bytes, temp_parent: Path | None = None) -> str:
+def mobi_text(data: bytes | Path, temp_parent: Path | None = None) -> str:
     # Validate the Palm database before starting the native decoder.
-    if len(data) < 86 or data[60:68] != b'BOOKMOBI':
-        raise ValueError('文件内容与 MOBI 格式不符。')
-    count = struct.unpack_from('>H', data, 76)[0]
-    if not 1 <= count <= 10000 or 78 + 8 * count > len(data):
-        raise ValueError('MOBI 记录目录无效或过大。')
-    offsets = [struct.unpack_from('>I', data, 78 + i * 8)[0] for i in range(count)]
-    if offsets[0] < 78 + 8 * count or offsets[-1] >= len(data) or any(a >= b for a, b in zip(offsets, offsets[1:])):
-        raise ValueError('MOBI 文件已损坏。')
-    header = offsets[0]
-    if header + 16 > (offsets[1] if count > 1 else len(data)):
-        raise ValueError('MOBI 文件头不完整。')
-    if struct.unpack_from('>H', data, header + 12)[0]:
+    size = data.stat().st_size if isinstance(data, Path) else len(data)
+    with (data.open('rb') if isinstance(data, Path) else io.BytesIO(data)) as stream:
+        palm = stream.read(78)
+        if size < 86 or palm[60:68] != b'BOOKMOBI':
+            raise ValueError('文件内容与 MOBI 格式不符。')
+        count = struct.unpack_from('>H', palm, 76)[0]
+        if not 1 <= count <= 10000 or 78 + 8 * count > size:
+            raise ValueError('MOBI 记录目录无效或过大。')
+        directory = stream.read(8 * count)
+        offsets = [struct.unpack_from('>I', directory, i * 8)[0] for i in range(count)]
+        if offsets[0] < 78 + 8 * count or offsets[-1] >= size or any(a >= b for a, b in zip(offsets, offsets[1:])):
+            raise ValueError('MOBI 文件已损坏。')
+        if offsets[0] + 16 > (offsets[1] if count > 1 else size):
+            raise ValueError('MOBI 文件头不完整。')
+        stream.seek(offsets[0])
+        header = stream.read(16)
+    if struct.unpack_from('>H', header, 12)[0]:
         raise ValueError('不支持加密或 DRM 保护的电子书。')
-    if struct.unpack_from('>I', data, header + 4)[0] > MAX_EXPANDED:
+    if struct.unpack_from('>I', header, 4)[0] > MAX_EXPANDED:
         raise ValueError('电子书解压后过大，请拆分文件。')
     if not shutil.which('mobitool'):
         raise ValueError('MOBI 解析组件尚未安装，请联系管理员。')
@@ -164,7 +171,10 @@ def mobi_text(data: bytes, temp_parent: Path | None = None) -> str:
     with tempfile.TemporaryDirectory(prefix='mobi-', dir=temp_parent) as temp:
         root = Path(temp)
         source = root / 'book.mobi'
-        source.write_bytes(data)
+        if isinstance(data, Path):
+            shutil.copyfile(data, source)
+        else:
+            source.write_bytes(data)
         try:
             subprocess.run([sys.executable, '-m', 'app.mobi_convert', str(source), str(root)],
                            check=True, timeout=45, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -173,4 +183,4 @@ def mobi_text(data: bytes, temp_parent: Path | None = None) -> str:
         output = root / 'book.epub'
         if not output.is_file() or output.stat().st_size > MAX_EXPANDED:
             raise ValueError('MOBI 未能转换为可朗读电子书，或内容过大。')
-        return epub_text(output.read_bytes())
+        return epub_text(output)

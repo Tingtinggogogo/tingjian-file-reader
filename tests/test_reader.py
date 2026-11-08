@@ -152,7 +152,6 @@ def test_12_audio_ownership_and_cleanup(client):
 
 def test_13_expiry_recovery_and_active_delete(client):
     job_id = client.post('/api/speech', json={'content': '过期内容', 'consent': True}).json()['id']
-    assert client.delete('/api/data').status_code == 409
     path = main.DATA / (job_id + '.mp3'); path.write_bytes(b'test')
     with main.DB.begin() as db:
         db.execute(text("UPDATE jobs SET status='processing' WHERE id=:id"), {'id': job_id})
@@ -308,7 +307,7 @@ def test_22_epub_rejects_unreadable_or_unsafe_books(kind):
     elif kind == 'missing':
         extra['Books/package.opf'] = '<package><manifest/><spine><itemref idref="missing"/></spine></package>'
     elif kind == 'oversized':
-        chapters = {'long.xhtml': '<p>' + '中' * 30001 + '</p>'}
+        chapters = {'long.xhtml': '<p>' + '中' * 300001 + '</p>'}
     elif kind == 'empty':
         chapters = {'image.xhtml': '<html><body><img src="cover.png"/></body></html>'}
     elif kind == 'invalid':
@@ -350,7 +349,7 @@ def test_25_mobi_drm_corruption_and_expansion_limit(client):
     with pytest.raises(ValueError, match='格式不符'):
         extract(b'fake mobi', 'fake.mobi')
     data = bytearray(mobi_sample()); header = struct.unpack_from('>I', data, 78)[0]
-    struct.pack_into('>I', data, header + 4, 80 * 1024 * 1024 + 1)
+    struct.pack_into('>I', data, header + 4, 256 * 1024 * 1024 + 1)
     with pytest.raises(ValueError, match='解压后过大'):
         extract(bytes(data), 'bomb.mobi')
     struct.pack_into('>I', data, 78, 0)
@@ -370,3 +369,145 @@ def test_26_mobi_timeout_cleans_temporary_files(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='超时'):
         extract(mobi_sample(), 'timeout.mobi', tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize('status', ['queued', 'failed', 'done'])
+def test_delete_one_private_job_in_any_state(client, status):
+    job = client.post('/api/speech', json={'content': '测试', 'consent': True}).json()['id']
+    other_job = client.post('/api/speech', json={'content': '保留', 'consent': True}).json()['id']
+    with main.DB.begin() as db:
+        db.execute(text('UPDATE jobs SET status=:s WHERE id=:id'), {'s': status, 'id': job})
+    (main.DATA / (job + '.mp3')).write_bytes(b'private')
+    outsider = TestClient(main.app, headers={'Origin': 'http://testserver'})
+    outsider.post('/api/session', json={})
+    assert outsider.delete('/api/jobs/' + job).status_code == 404
+    assert client.delete('/api/jobs/' + job, headers={'Origin': 'https://bad.test'}).status_code == 403
+    assert client.delete('/api/jobs/' + job).status_code == 200
+    assert [j['id'] for j in client.get('/api/jobs').json()] == [other_job]
+    assert client.get('/api/audio/' + job).status_code == 404
+    assert not (main.DATA / (job + '.mp3')).exists()
+
+
+@pytest.mark.parametrize('bulk', [False, True])
+def test_cancel_running_process_and_no_late_audio(client, monkeypatch, bulk):
+    import threading
+    import subprocess
+    job_id = client.post('/api/speech', json={'content': '取消测试', 'consent': True}).json()['id']
+    started = threading.Event()
+    children = []
+    def launch(job):
+        directory = main.workdir(job['id'])
+        directory.mkdir()
+        target = directory / 'audio.mp3'
+        target.write_bytes(b'unpublished')
+        proc = subprocess.Popen([main.sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
+        children.append(proc)
+        started.set()
+        return proc, target
+    monkeypatch.setattr(main, 'launch', launch)
+    main.STOP.clear()
+    worker = threading.Thread(target=main.run_next)
+    worker.start()
+    try:
+        assert started.wait(5)
+        assert client.get('/api/jobs').json()[0]['status'] == 'processing'
+        assert client.delete('/api/data' if bulk else '/api/jobs/' + job_id).status_code == 200
+        worker.join(5)
+        assert not worker.is_alive() and children[0].poll() is not None
+        assert client.get('/api/jobs').json() == []
+        assert not main.workdir(job_id).exists()
+        assert not (main.DATA / (job_id + '.mp3')).exists()
+        main.initialize()
+        assert client.get('/api/audio/' + job_id).status_code == 404
+    finally:
+        for proc in children:
+            main.stop_process(proc)
+        worker.join(5)
+
+
+def test_deleting_job_preserves_hourly_allowance(client):
+    for _ in range(10):
+        job = client.post('/api/speech', json={'content': '公开测试', 'consent': True})
+        assert job.status_code == 202
+        assert client.delete('/api/jobs/' + job.json()['id']).status_code == 200
+    assert client.post('/api/speech', json={'content': '公开测试', 'consent': True}).status_code == 429
+
+
+def test_long_book_order_advancement_restart_and_private_removal(client):
+    content = '这一段是中文测试。' * 7300
+    response = client.post('/api/books', json={'content': content, 'title': '长篇.epub', 'consent': True})
+    assert response.status_code == 202
+    book_id = response.json()['book_id']
+    rows = client.get('/api/jobs').json()
+    assert 1 < len(rows) == response.json()['parts']
+    assert [j['part_no'] for j in rows] == list(range(1, len(rows)+1))
+    assert [j['status'] for j in rows] == ['queued'] + ['scheduled']*(len(rows)-1)
+    with main.DB.connect() as db:
+        parts = db.execute(text('SELECT content FROM jobs WHERE book_id=:b ORDER BY part_no'), {'b': book_id}).scalars().all()
+        assert ''.join(parts) == content and max(map(len, parts)) <= 5000
+    assert client.post('/api/books', json={'content': content, 'title': '另一本.mobi', 'consent': True}).status_code == 429
+    main.initialize()
+    assert client.delete('/api/jobs/' + rows[0]['id']).status_code == 200
+    assert client.get('/api/jobs').json()[0]['status'] == 'queued'
+    with main.DB.begin() as db:
+        db.execute(text("UPDATE jobs SET status='done' WHERE id=:id"), {'id': rows[1]['id']})
+        main.advance_book(db, book_id)
+    assert client.get('/api/jobs').json()[1]['status'] == 'queued'
+    outsider = TestClient(main.app, headers={'Origin': 'http://testserver'})
+    outsider.post('/api/session', json={})
+    assert outsider.delete('/api/books/' + book_id).status_code == 404
+    assert client.delete('/api/books/' + book_id).status_code == 200
+    assert client.get('/api/jobs').json() == []
+
+
+def test_large_ebook_upload_and_draft(client):
+    from ebook_samples import epub_sample
+    # A valid ebook with an incompressible illustration larger than 30 MiB.
+    content = '大书测试。' * 8000
+    data = epub_sample(chapters={'book.xhtml': '<p>'+content+'</p>'}, extra={'Books/art.bin': os.urandom(31 * 1024**2)})
+    assert 30 * 1024**2 < len(data) < main.EBOOK_UPLOAD
+    uploaded = client.post('/api/extract', files={'file': ('大书.epub', data)})
+    assert uploaded.status_code == 200 and uploaded.json()['content'] == content
+    assert client.put('/api/draft', json={'content': content, 'filename': '大书.epub'}).status_code == 200
+    assert client.get('/api/draft').json() == {'content': content, 'filename': '大书.epub'}
+    assert len(extract(epub_sample(chapters={'full.xhtml': '<p>' + '中'*300000 + '</p>'}), '满额.epub')) == 300000
+    assert client.post('/api/books', json={'content': '中' * 300001, 'title': '大书.epub', 'consent': True}).status_code == 422
+
+
+def test_parallel_parts_preserve_audio_order(tmp_path, monkeypatch):
+    import asyncio
+    import array
+    import shutil
+    import subprocess
+    import edge_tts
+    from app.tts import split_text, synthesize
+    assert shutil.which('ffmpeg'), 'Install FFmpeg to test speech assembly'
+    content = '第一句。' * 30 + '第二句。' * 30 + '第三句。' * 30
+    parts = split_text(content)
+    assert ''.join(parts) == content and len(parts) == 3
+    for i, hz in enumerate([300, 600, 900]):
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', f'sine=frequency={hz}:duration=0.5',
+                        '-ar', '24000', '-ac', '1', '-b:a', '48k', str(tmp_path/f'tone{i}.mp3')], check=True)
+    started, finished = [], []
+    class Speech:
+        def __init__(self, chunk, voice, *, rate):
+            self.index = parts.index(chunk)
+        async def save(self, filename):
+            started.append(self.index)
+            while len(started) < 3:
+                await asyncio.sleep(.001)
+            await asyncio.sleep(.02 * (2-self.index))
+            shutil.copyfile(tmp_path/f'tone{self.index}.mp3', filename)
+            finished.append(self.index)
+    monkeypatch.setattr(edge_tts, 'Communicate', Speech)
+    output = tmp_path/'book.mp3'
+    synthesize(content, 'female', 'edge', output, 'slow')
+    assert finished == [2, 1, 0]
+    pcm = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(output), '-f', 's16le', '-ac', '1', '-ar', '24000', '-'])
+    samples = array.array('h', pcm)
+    for i, frequency in enumerate([300, 600, 900]):
+        start = int((i * .55 + .2) * 24000)
+        window = samples[start:start+2400]
+        crossings = sum(a < 0 <= b for a,b in zip(window, window[1:]))
+        assert abs(crossings - frequency / 10) <= 2
+    assert not list(tmp_path.glob('part-*.mp3'))

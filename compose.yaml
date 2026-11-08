@@ -19,6 +19,7 @@ services:
     build: .
     restart: unless-stopped
     environment:
+      TMPDIR: /data/spool
       DATABASE_URL: postgresql+psycopg://reader:${POSTGRES_PASSWORD}@db/reader
       SESSION_SECRET: ${SESSION_SECRET:?set a session secret}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set the HTTPS origin}

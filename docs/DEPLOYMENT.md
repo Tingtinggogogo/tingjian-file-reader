@@ -10,7 +10,7 @@
 
 ## 源码与分支
 
-唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、34 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
+唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、43 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
 
 ## 环境准备
 
@@ -36,7 +36,7 @@ docker compose --env-file .env.staging --project-name tingjian-staging ps
 curl --fail http://127.0.0.1:18081/api/health
 ```
 
-项目名使 PostgreSQL 与音频卷隔离；严禁给 staging 配置生产数据库 URL 或生产卷。数据库端口不对外发布，应用入口仅绑定服务器回环地址，HTTPS 由现有入口终结。上游已限制请求大小，nginx 仍需配置 `client_max_body_size 21m` 和足够超时。
+项目名使 PostgreSQL 与音频卷隔离；严禁给 staging 配置生产数据库 URL 或生产卷。数据库端口不对外发布，应用入口仅绑定服务器回环地址，HTTPS 由现有入口终结。上游已限制请求大小，上传路径配置 `client_max_body_size 81m` 以容纳表单边界，应用分别校验 80/20 MiB。Nginx 限制同时两次上传，应用同一时间最多解析一本电子书。
 
 ## HTTPS 与生产切换
 
@@ -48,7 +48,7 @@ Nginx 修改前备份，`nginx -t` 通过后才 reload；不要重启其他业�
 
 ## 限制与运行检查
 
-- 单个应用实例、一个 worker；磁盘占用与内存要监控，声音最长 3 分钟合成超时，解析 60 秒超时。
+- 单个 Uvicorn 进程、两个后台语音线程；磁盘占用与内存要监控，声音最长 3 分钟合成超时，解析 60 秒超时。
 - 无口令公开访问，以签名 Cookie 隔离浏览器历史；不是实名账户系统。Cookie 有效 180 天并续期，录音保存 30 天，清除 Cookie/换设备无法找回。
 - Nginx 提供入口限制；不盲信任 X-Forwarded-For。数据库全站计数限制上传 120 次/小时、朗读 100 次/小时及 500 次/日，清除会话或记录不能绕过；每会话 10 次/小时，队列 20 个；草稿写入全站 600 次/小时。
 - 原文件不长期保存；异常中断遗留的上传临时目录会在下次运行清理周期清除（至少一小时前的目录），维护时不能删除活跃任务。
@@ -92,4 +92,10 @@ curl --fail https://read.tinsmartfm.com/api/health
 
 镜像新增发行版 `libmobi-tools` 软件包，Python 显式依赖 defusedxml。CI 也安装 mobitool 并进行真实 MOBI 解码测试。部署前镜像必须构建成功；只更新独立 reader app，无数据库迁移，无需修改其他服务或公网路由。
 
-MOBI 子进程限制 45 秒墙钟时间、40 秒 CPU、256 MiB 地址空间（Linux）和 80 MiB 单输出文件；不能传入解密密钥。临时转换目录位于该次上传目录，成功/失败均清理。EPUB 不释放 ZIP 文件到磁盘，只按 spine 阅读安全路径里的正文，不加载外部资源。原有 20 MB/30,000 字限制不变。详见 EBOOKS.md。
+MOBI 子进程限制 45 秒墙钟时间、40 秒 CPU、256 MiB 地址空间（Linux）和 128 MiB 单输出文件；不能传入解密密钥。临时转换目录位于该次上传目录，成功/失败均清理。EPUB 不释放 ZIP 文件到磁盘，只按 spine 阅读安全路径里的正文，不加载外部资源。电子书支持 80 MB / 30 万字，普通文件 20 MB / 3 万字。详见 EBOOKS.md。
+
+## 整本生成与取消
+
+本版向 jobs 增加整本编号、部号、总数和排队时间，向 drafts 增加文件名，以 speech_usage 独立记录近一小时提交用量。启动时兼容已有录音，恢复中断任务。每个任务使用自己的临时目录，最终音频完成后原子发布。删除时先撤销数据库记录，再停止子进程组并清理部分音频。启动时清理意外中断遗留的未发布文件。
+
+从通过 CI 的 GitHub 提交构建独立 app。更新 app 和本项目 web，保留数据库及音频卷。web 单文件挂载的 nginx 配置有变动时需重建 web 容器以重新挂载文件。上传缓冲使用数据卷中的 spool 目录。部署后验证 Nginx 配置、80 MB 上传入口、实际 FFmpeg 合并、单条/整本删除和健康状态。旧版本回滚前应完成或取消新版本的整本任务，旧程序无法继续 scheduled 部分。

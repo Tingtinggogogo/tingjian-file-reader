@@ -35,7 +35,7 @@ jobs:
             sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
           fi
           sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y libmobi-tools espeak-ng tesseract-ocr tesseract-ocr-chi-sim
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libmobi-tools espeak-ng tesseract-ocr tesseract-ocr-chi-sim
       - run: pip install -r requirements-dev.txt
       - run: python scripts/guardrails.py
       - run: pip-audit -r requirements.txt

@@ -1,14 +1,23 @@
 """Each parse/TTS runs in a disposable subprocess with a wall-clock limit."""
 import sys
 from pathlib import Path
-from app.extract import extract
 from app.tts import synthesize
 
 if __name__ == '__main__':
     mode, source, target, *args = sys.argv[1:]
     if mode == 'extract':
+        from app.extract import extract
+        from app.ebooks import epub_text, mobi_text
         try:
-            Path(target).write_text(extract(Path(source).read_bytes(), args[0], Path(source).parent), encoding='utf-8')
+            path = Path(source)
+            ext = Path(args[0]).suffix.lower()
+            if ext == '.epub':
+                content = epub_text(path)
+            elif ext == '.mobi':
+                content = mobi_text(path, path.parent)
+            else:
+                content = extract(path.read_bytes(), args[0], path.parent)
+            Path(target).write_text(content, encoding='utf-8')
         except ValueError as exc:
             Path(target + '.error').write_text(str(exc), encoding='utf-8')
             sys.exit(2)

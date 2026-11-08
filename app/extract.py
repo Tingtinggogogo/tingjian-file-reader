@@ -22,7 +22,7 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
                 raise ValueError('不支持加密文档。')
     if ext in {'.epub', '.mobi'}:
         from app.ebooks import epub_text, mobi_text
-        text = epub_text(data) if ext == '.epub' else mobi_text(data, temp_parent)
+        return epub_text(data) if ext == '.epub' else mobi_text(data, temp_parent)
     elif ext == '.pdf':
         from pypdf import PdfReader
         if not data.startswith(b'%PDF-'):
