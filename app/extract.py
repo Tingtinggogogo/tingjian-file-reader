@@ -32,14 +32,31 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
             raise ValueError('请先移除 PDF 密码。')
         if len(reader.pages) > 100:
             raise ValueError('PDF 最多 100 页，请拆分。')
-        chunks, size = [], 0
+        chunks, margins, size = [], [], 0
         for page in reader.pages:
-            chunk = page.extract_text() or ''
+            top, bottom = set(), set()
+            box = page.cropbox
+            low, high = float(box.bottom), float(box.top)
+            band = (high - low) * 0.10
+
+            def locate(fragment, cm, tm, font, font_size):
+                line = fragment.strip()
+                if not line or len(line.splitlines()) != 1 or page.rotation:
+                    return
+                y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+                if high - band <= y <= high:
+                    top.add(line)
+                elif low <= y <= low + band:
+                    bottom.add(line)
+
+            chunk = page.extract_text(visitor_text=locate) or ''
+            margins.append((top, bottom))
             size += len(chunk)
             if size > MAX_TEXT:
                 raise ValueError('提取文字超过 30000 字，请拆分文件。')
             chunks.append(chunk)
-        text = '\n'.join(chunks)
+        from app.reading_text import pdf_body
+        text = pdf_body(chunks, margins)
     elif ext == '.docx':
         from docx import Document
         doc = Document(io.BytesIO(data))
@@ -64,8 +81,11 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
         text = '\n'.join(chunks)
     elif ext == '.pptx':
         from pptx import Presentation
+        from pptx.enum.shapes import PP_PLACEHOLDER
         slides = Presentation(io.BytesIO(data)).slides
-        text = '\n'.join(s.text for slide in slides for s in slide.shapes if s.has_text_frame)
+        margins = {PP_PLACEHOLDER.HEADER, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER}
+        text = '\n'.join(s.text for slide in slides for s in slide.shapes if s.has_text_frame
+                         and not (s.is_placeholder and s.placeholder_format.type in margins))
     elif ext in {'.png', '.jpg', '.jpeg', '.webp'}:
         import pytesseract
         Image.MAX_IMAGE_PIXELS = 16000000

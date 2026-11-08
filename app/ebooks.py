@@ -44,6 +44,10 @@ class ChapterText(HTMLParser):
         tag = tag.split(':')[-1]
         attributes = dict(attrs)
         hidden = tag in self.SKIP or 'hidden' in attributes or attributes.get('aria-hidden') == 'true'
+        semantics = set((attributes.get('epub:type') or '').lower().split())
+        roles = set((attributes.get('role') or '').lower().split())
+        hidden = hidden or bool(semantics & {'copyright-page', 'colophon', 'pagebreak'})
+        hidden = hidden or bool(roles & {'doc-pagebreak', 'doc-colophon'})
         hidden = hidden or bool(self.stack and self.stack[-1][1])
         if not hidden and tag in self.BLOCK:
             self.add('\n')

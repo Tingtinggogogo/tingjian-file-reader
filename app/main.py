@@ -13,6 +13,8 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from app.reading_text import spoken_text
+
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -434,6 +436,9 @@ def enqueue(body: Speech, request: Request, whole_book=False):
     content = body.content.strip()
     if not content:
         raise HTTPException(422, '请先上传文件或输入文字。')
+    content = spoken_text(content, body.title)
+    if not content:
+        raise HTTPException(422, '跳过出版、通讯和页码信息后，没有可朗读的正文。')
     parts = book_parts(content) if whole_book else [content]
     book_id = str(uuid.uuid4()) if len(parts) > 1 else ''
     if not EDGE_ENABLED or not body.consent:

@@ -511,3 +511,107 @@ def test_parallel_parts_preserve_audio_order(tmp_path, monkeypatch):
         crossings = sum(a < 0 <= b for a,b in zip(window, window[1:]))
         assert abs(crossings - frequency / 10) <= 2
     assert not list(tmp_path.glob('part-*.mp3'))
+
+
+def test_spoken_body_shared_by_drafts_files_and_whole_books(client):
+    from app.reading_text import spoken_text
+    body = '摘要：我们通过电子邮件招募参与者。\n本研究比较了两个出版社的定价。\n结果：联系率为 97%，见文献 [2]。'
+    noisy = '出版信息\n出版社：示例出版社\nISBN 978-7-1234-5678-9\n通讯作者：王某\nE-mail: writer@example.org\n' + body + '\n第 3 页 共 8 页'
+    assert spoken_text(noisy) == body
+    assert client.put('/api/draft', json={'content': noisy, 'filename': '论文.txt'}).status_code == 200
+    for path, title in [('/api/speech', '论文.txt'), ('/api/books', '论文.epub')]:
+        result = client.post(path, json={'content': noisy, 'title': title, 'consent': True})
+        assert result.status_code == 202
+        with main.DB.connect() as db:
+            assert db.execute(text('SELECT content FROM jobs WHERE id=:id'), result.json()).scalar_one() == body
+    assert client.get('/api/draft').json()['content'] == noisy
+    assert spoken_text('通讯作者：王某。摘要：保留摘要。') == '摘要：保留摘要。'
+    assert spoken_text('正文中引用 doi:10.1234/test 和 user@example.org。') == '正文中引用 doi:10.1234/test 和 user@example.org。'
+    assert spoken_text('请写信给reader@example.org。') == '请写信给reader@example.org。'
+    assert spoken_text('电子邮箱：本节讲解如何使用邮箱。') == '电子邮箱：本节讲解如何使用邮箱。'
+    assert spoken_text('通讯作者：李某\n地址：某路 17 号\n摘要：保留正文。') == '摘要：保留正文。'
+    assert spoken_text('版权页\n作者：李某\n第一章\n作者：这句话是正文。') == '第一章\n作者：这句话是正文。'
+    assert spoken_text('定价：不同组的结果有显著差异。') == '定价：不同组的结果有显著差异。'
+
+
+def test_metadata_only_does_not_enqueue_or_charge(client):
+    result = client.post('/api/speech', json={'content': 'DOI: 10.1234/test\nCorresponding author: Jane Doe\nPage 2 of 8', 'consent': True})
+    assert result.status_code == 422 and '没有可朗读的正文' in result.json()['detail']
+    assert client.get('/api/jobs').json() == []
+    with main.DB.connect() as db:
+        assert db.execute(text("SELECT count(*) FROM usage_limits WHERE bucket LIKE 'speech-%'")).scalar_one() == 0
+
+
+def test_book_cleaned_before_boundaries(client):
+    content = '第一章\n' + ('这里保留引用 [2] 和结论。\n出版社：示例出版社\n通讯作者：作者甲\n' * 600) + '最后一句。'
+    result = client.post('/api/books', json={'content':content,'title':'示例.epub','consent':True})
+    assert result.status_code == 202 and result.json()['parts'] > 1
+    with main.DB.connect() as db:
+        parts = db.execute(text('SELECT content FROM jobs WHERE book_id=:id ORDER BY part_no'),
+                           {'id':result.json()['book_id']}).scalars().all()
+    assert ''.join(parts) == '第一章\n' + '这里保留引用 [2] 和结论。\n' * 600 + '最后一句。'
+
+
+def test_structured_ebook_ignores_colophon_but_keeps_body():
+    from ebook_samples import epub_sample
+    data = epub_sample(chapters={'c.xhtml': '<section epub:type="copyright-page"><p>Book designer details</p></section>'
+                       '<p>第一章<span epub:type="pagebreak">22</span>：出版史。</p>'
+                       '<span role="doc-pagebreak">23</span><p>仍要朗读。</p>'})
+    assert extract(data, 'b.epub') == '第一章：出版史。\n仍要朗读。'
+
+
+def test_pdf_repeated_margins_from_real_pdf():
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+    writer = PdfWriter()
+    font = DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),
+                             NameObject('/BaseFont'):NameObject('/Helvetica')})
+    ref = writer._add_object(font)
+    for i in range(1, 5):
+        page = writer.add_blank_page(300, 400)
+        page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):ref})})
+        lines = ['Research Journal', 'Internal measurement label', f'Result {i} is significant.', 'Repeated finding.', str(i)]
+        stream = DecodedStreamObject()
+        stream.set_data(('\n'.join(f'BT /F1 10 Tf 15 {y} Td ({line}) Tj ET' for y,line in zip([378,290,230,155,20], lines))).encode())
+        page[NameObject('/Contents')] = writer._add_object(stream)
+    output = io.BytesIO()
+    writer.write(output)
+    read = extract(output.getvalue(),'paper.pdf').splitlines()
+    assert read.count('Research Journal') == 1 and read.count('Repeated finding.') == 4
+    assert read.count('Internal measurement label') == 4
+    assert not any(line.strip().isdigit() for line in read)
+    assert all(f'Result {i} is significant.' in read for i in range(1,5))
+
+
+def test_structured_table_and_json_preserve_results():
+    from app.reading_text import spoken_text
+    table = '通讯作者,结果,出版日期\n张三,研究结果为 12,2020\n李四,正文引用 [2],2022'
+    assert spoken_text(table, '论文.csv').splitlines() == ['结果', '研究结果为 12', '正文引用 [2]']
+    assert spoken_text(table.replace(',', '，'), '论文.xlsx').splitlines() == ['结果', '研究结果为 12', '正文引用 [2]']
+    assert '作者甲' not in spoken_text('{\n  "通讯作者": "作者甲",\n  "结果": "数据为 12"\n}', '正文.json')
+
+
+def test_office_structural_headers_and_body():
+    from docx import Document
+    from pptx import Presentation
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.util import Inches
+    doc = Document()
+    doc.sections[0].header.paragraphs[0].text = '页眉文字'
+    doc.sections[0].footer.paragraphs[0].text = '页脚文字'
+    doc.add_paragraph('保留正文。')
+    buf = io.BytesIO()
+    doc.save(buf)
+    assert extract(buf.getvalue(), 'test.docx') == '保留正文。'
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    for label, kind in [('页眉文字', 'hdr'), ('页脚文字','ftr'), ('99','sldNum'), ('保留正文。',None)]:
+        shape = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(2), Inches(1))
+        shape.text = label
+        if kind:
+            ph = OxmlElement('p:ph')
+            ph.set('type',kind)
+            shape._element.nvSpPr.nvPr.append(ph)
+    buf = io.BytesIO()
+    deck.save(buf)
+    assert extract(buf.getvalue(), 'test.pptx') == '保留正文。'
