@@ -10,19 +10,19 @@ for file in required:
         errors.append(f'Missing {file}')
 static = root / 'app/static'
 for path in static.glob('*'):
-    content = path.read_text()
-    if re.search(r'(?:src|href)=["\']https?://', content):
+    content = path.read_bytes()
+    if re.search(rb'(?:src|href)=["\']https?://', content):
         errors.append(f'External frontend dependency: {path.name}')
-    if 'innerHTML' in content:
+    if b'innerHTML' in content:
         errors.append(f'Unsafe HTML rendering: {path.name}')
 for folder in ('app', 'scripts', 'tests', '.github', 'deploy'):
     for path in (root / folder).rglob('*'):
         if not path.is_file() or '__pycache__' in str(path):
             continue
-        content = path.read_text()
-        if re.search(r'-----BEGIN (?:OPENSSH|RSA|EC) PRIVATE KEY-----', content):
+        content = path.read_bytes()
+        if re.search(rb'-----BEGIN (?:OPENSSH|RSA|EC) PRIVATE KEY-----', content):
             errors.append(f'Private key in {path}')
-        if ('shell' + '=True') in content:
+        if (b'shell' + b'=True') in content:
             errors.append(f'Shell execution in {path}')
 workflow = (root / '.github/workflows/ci.yml').read_text()
 if any(x in workflow for x in ('ssh ', 'scp ', 'docker push', 'pull_request_target')):
