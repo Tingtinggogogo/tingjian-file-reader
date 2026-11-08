@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import math
 import shutil
 import sys
 import subprocess
@@ -31,9 +32,27 @@ def split_text(text: str) -> list[str]:
     return parts if all(part.strip() for part in parts) else [text]
 
 
+def speech_timeout(length):
+    return 180 * max(1, math.ceil(length / 5000))
+
+
+def synthesis_parts(content):
+    if len(content) <= 5000:
+        return split_text(content)
+    chunks = []
+    while len(content) > 1800:
+        window = content[:1800]
+        end = max((window.rfind(mark)+1 for mark in '。！？；\n'),default=0)
+        end = end if end >= 900 else 1800
+        chunks.append(content[:end])
+        content = content[end:]
+    chunks.append(content)
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
 async def synthesize_edge(text, voice, target, rate):
     import edge_tts
-    parts = split_text(text)
+    parts = synthesis_parts(text)
     progress = target.parent / 'progress.json'
     completed = 0
 
@@ -50,9 +69,12 @@ async def synthesize_edge(text, voice, target, rate):
         return
     paths = [target.parent / f'part-{index}.mp3' for index in range(len(parts))]
 
+    concurrency = asyncio.Semaphore(PARALLEL_PARTS)
+
     async def generate(index):
         nonlocal completed
-        await edge_tts.Communicate(parts[index], VOICES[voice], rate=RATES[rate]).save(str(paths[index]))
+        async with concurrency:
+            await edge_tts.Communicate(parts[index], VOICES[voice], rate=RATES[rate]).save(str(paths[index]))
         completed += 1
         report()
 
@@ -65,7 +87,7 @@ async def synthesize_edge(text, voice, target, rate):
         # Stream-copy consistent MP3 frames; no resampling or voice-speed change.
         subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'concat', '-safe', '1',
                         '-i', str(listing), '-map_metadata', '-1', '-c:a', 'copy', str(target)],
-                       check=True, timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       check=True, timeout=max(15,len(parts)), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     finally:
         for path in paths:
             path.unlink(missing_ok=True)
@@ -76,7 +98,7 @@ def synthesize(text: str, voice: str, provider: str, target: Path, rate: str = '
     if voice not in VOICES or rate not in RATES:
         raise ValueError('不支持的音色或语速')
     if provider == 'edge':
-        asyncio.run(asyncio.wait_for(synthesize_edge(text, voice, target, rate), timeout=180))
+        asyncio.run(asyncio.wait_for(synthesize_edge(text, voice, target, rate), timeout=speech_timeout(len(text))))
     elif provider == 'offline':
         # Fixed argv; uploaded text is stdin, never a shell command.
         if shutil.which('espeak-ng'):

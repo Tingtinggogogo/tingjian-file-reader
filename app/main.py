@@ -2,6 +2,9 @@ import os
 import signal
 import logging
 import json
+import hashlib
+import math
+import re
 import secrets
 import shutil
 import subprocess
@@ -14,6 +17,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app.reading_text import spoken_text
+from app.chapters import sections, text_marks
+from app.tts import speech_timeout
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -45,7 +50,10 @@ STOP = threading.Event()
 QUEUE = threading.Condition()
 RUNNING = {}
 WORKER_COUNT = 2
+LITERATURE = {'.epub','.mobi','.pdf','.docx','.md','.txt'}
 SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS reading_outlines (owner VARCHAR(64) NOT NULL, digest VARCHAR(64) NOT NULL,
+       layout TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL, PRIMARY KEY(owner,digest))""",
     'CREATE TABLE IF NOT EXISTS drafts (owner VARCHAR(64) PRIMARY KEY, content TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL)',
     '''CREATE TABLE IF NOT EXISTS jobs (id VARCHAR(36) PRIMARY KEY, owner VARCHAR(64) NOT NULL,
     content TEXT NOT NULL, voice VARCHAR(16) NOT NULL, provider VARCHAR(16) NOT NULL,
@@ -69,7 +77,9 @@ def initialize():
         for column, definition in (('book_id', "VARCHAR(36) NOT NULL DEFAULT ''"),
                                    ('part_no', 'INTEGER NOT NULL DEFAULT 1'),
                                    ('part_total', 'INTEGER NOT NULL DEFAULT 1'),
-                                   ('ready_at', 'DOUBLE PRECISION NOT NULL DEFAULT 0')):
+                                   ('ready_at', 'DOUBLE PRECISION NOT NULL DEFAULT 0'),
+                                   ('chapter_title', "VARCHAR(160) NOT NULL DEFAULT ''"),
+                                   ('budget_due', 'INTEGER NOT NULL DEFAULT 0')):
             if column not in columns:
                 db.execute(text(f'ALTER TABLE jobs ADD COLUMN {column} {definition}'))
         if 'filename' not in {col['name'] for col in inspect(db).get_columns('drafts')}:
@@ -92,6 +102,7 @@ def cleanup():
         ids = db.execute(text('SELECT id FROM jobs WHERE created < :c'), {'c': cutoff}).scalars().all()
         db.execute(text('DELETE FROM jobs WHERE created < :c'), {'c': cutoff})
         db.execute(text('DELETE FROM drafts WHERE updated < :c'), {'c': time.time() - 86400})
+        db.execute(text('DELETE FROM reading_outlines WHERE updated<:c'), {'c':time.time()-86400})
         db.execute(text('DELETE FROM speech_usage WHERE created < :c'), {'c': time.time() - 3600})
         db.execute(text('DELETE FROM usage_limits WHERE created < :c'), {'c': time.time() - 172800})
     for job_id in ids:
@@ -122,6 +133,10 @@ def stop_process(proc):
 
 
 def launch(job):
+    check_storage()
+    # Allow temporary segment files and the final MP3 to coexist during merging.
+    if shutil.disk_usage(DATA).free < MIN_FREE_BYTES + 8192 * len(job['content']):
+        raise OSError('Insufficient space for speech assembly')
     directory = workdir(job['id'])
     directory.mkdir(mode=0o700)
     source = directory / 'source.txt'
@@ -147,10 +162,18 @@ def run_next():
         if STOP.is_set():
             return
         with DB.begin() as db:
-            row = db.execute(text("SELECT * FROM jobs WHERE status='queued' ORDER BY CASE WHEN ready_at=0 THEN created ELSE ready_at END,id LIMIT 1")).mappings().first()
+            row = db.execute(text("SELECT * FROM jobs WHERE status='queued' AND ready_at <= :now ORDER BY CASE WHEN ready_at=0 THEN created ELSE ready_at END,id LIMIT 1"), {'now': time.time()}).mappings().first()
             if row:
                 job = dict(row)
-                db.execute(text("UPDATE jobs SET status='processing' WHERE id=:id"), job)
+                if job['budget_due']:
+                    try:
+                        with db.begin_nested():
+                            charge_speech(db, math.ceil(len(job['content']) / BOOK_PART))
+                    except HTTPException:
+                        db.execute(text("UPDATE jobs SET ready_at=:t WHERE id=:id"),
+                                   {'id':job['id'],'t':time.time()+60})
+                        return
+                db.execute(text("UPDATE jobs SET status='processing',budget_due=0 WHERE id=:id"), job)
         if not row:
             QUEUE.wait(timeout=1)
             return
@@ -168,7 +191,7 @@ def run_next():
 
     ok = False
     try:
-        ok = proc.wait(timeout=200) == 0
+        ok = proc.wait(timeout=speech_timeout(len(job['content'])) + 20) == 0
     except subprocess.TimeoutExpired:
         with QUEUE:
             stop_process(proc)
@@ -299,6 +322,15 @@ def reserve_usage(db, name, period, limit, amount=1):
         raise HTTPException(429, '当前使用人数较多，请稍后再试。')
 
 
+def charge_speech(db, amount):
+    reserve_usage(db, 'speech-hour', 3600, 100, amount)
+    reserve_usage(db, 'speech-day', 86400, 500, amount)
+
+
+def outline_digest(content, filename):
+    return hashlib.sha256((filename + '\0' + content).encode()).hexdigest()
+
+
 def check_storage():
     used = 0
     for path in DATA.iterdir():
@@ -350,6 +382,8 @@ def save_draft(body: Draft, request: Request):
         raise HTTPException(422, '普通文件最多 3 万字。')
     with DB.begin() as db:
         reserve_usage(db, 'drafts-hour', 3600, 600)
+        db.execute(text('UPDATE reading_outlines SET updated=:t WHERE owner=:o AND digest=:d'),
+                   {'t':time.time(),'o':who,'d':outline_digest(body.content,body.filename)})
         db.execute(text('''INSERT INTO drafts(owner,content,updated,filename) VALUES(:o,:c,:u,:f)
         ON CONFLICT(owner) DO UPDATE SET content=:c,updated=:u,filename=:f'''), {'o': who, 'c': body.content, 'u': time.time(), 'f': body.filename})
     return {'ok': True}
@@ -362,7 +396,7 @@ BOOK_PARSER = threading.BoundedSemaphore(1)
 
 @app.post('/api/extract')
 def upload(request: Request, file: UploadFile = File(...)):
-    owner(request)
+    who = owner(request)
     from app.extract import SUPPORTED
     name = Path(file.filename or '').name[:160]
     if Path(name).suffix.lower() not in SUPPORTED:
@@ -397,7 +431,17 @@ def upload(request: Request, file: UploadFile = File(...)):
             if result.returncode:
                 error = Path(str(target) + '.error')
                 raise HTTPException(422, error.read_text() if error.exists() else '文件损坏、格式不符或无法读取，请转换后重试。')
-            return {'content': target.read_text(encoding='utf-8'), 'filename': name}
+            content = target.read_text(encoding='utf-8')
+            marks = json.loads(Path(str(target)+'.outline').read_text(encoding='utf-8'))
+            marks = sorted(dict(marks).items())
+            if len(marks) > 1000:
+                raise HTTPException(422,'章节超过 1000，请拆分文件后上传。')
+            digest = outline_digest(content,name)
+            with DB.begin() as db:
+                db.execute(text('''INSERT INTO reading_outlines(owner,digest,layout,updated)
+                    VALUES(:o,:d,:m,:t) ON CONFLICT(owner,digest) DO UPDATE SET layout=:m,updated=:t'''),
+                           {'o':who,'d':digest,'m':json.dumps(marks,ensure_ascii=False),'t':time.time()})
+            return {'content':content,'filename':name,'chapter_count':len(marks)}
     finally:
         if is_book:
             BOOK_PARSER.release()
@@ -436,10 +480,28 @@ def enqueue(body: Speech, request: Request, whole_book=False):
     content = body.content.strip()
     if not content:
         raise HTTPException(422, '请先上传文件或输入文字。')
-    content = spoken_text(content, body.title)
-    if not content:
+    titles = []
+    named = []
+    if Path(body.title).suffix.lower() in LITERATURE:
+        with DB.connect() as db:
+            layout = db.execute(text('SELECT layout FROM reading_outlines WHERE owner=:o AND digest=:d'),
+                                {'o':who, 'd':outline_digest(body.content,body.title)}).scalar()
+        marks = json.loads(layout) if layout else []
+        named = sections(body.content, marks or text_marks(body.content))
+    if named:
+        parts = []
+        for title, raw in named:
+            cleaned = spoken_text(raw,body.title)
+            if cleaned:
+                parts.append(cleaned)
+                titles.append(title)
+        if len(parts)>1000:
+            raise HTTPException(422,'章节超过 1000，请拆分文件后上传。')
+    else:
+        content = spoken_text(content, body.title)
+        parts = (book_parts(content) if whole_book else [content]) if content else []
+    if not parts:
         raise HTTPException(422, '跳过出版、通讯和页码信息后，没有可朗读的正文。')
-    parts = book_parts(content) if whole_book else [content]
     book_id = str(uuid.uuid4()) if len(parts) > 1 else ''
     if not EDGE_ENABLED or not body.consent:
         raise HTTPException(422, '在线语音未启用，或你尚未同意将文字发送至微软。')
@@ -458,20 +520,20 @@ def enqueue(body: Speech, request: Request, whole_book=False):
                 status IN ('queued','processing','scheduled') GROUP BY owner""")).scalars().all()
             if who in busy or len(busy) >= 3:
                 raise HTTPException(429, '已有整本书在生成，请稍后再试。')
-        reserve_usage(db, 'speech-hour', 3600, 100, len(parts))
-        reserve_usage(db, 'speech-day', 86400, 500, len(parts))
+        charge_speech(db, max(1, math.ceil(len(parts[0]) / BOOK_PART)) if named else len(parts))
         created = time.time()
         values = [{'id': job if i == 1 else str(uuid.uuid4()), 'owner': who, 'part': part,
                    'book': book_id, 'number': i, 'total': len(parts), 'title': body.title.strip() or '文件朗读',
-                   'status': 'queued' if i == 1 else 'scheduled', 'created': created}
+                   'status': 'queued' if i == 1 else 'scheduled', 'created': created,
+                   'chapter':titles[i-1] if named else '', 'due':int(bool(named) and i>1)}
                   for i, part in enumerate(parts, 1)]
-        db.execute(text("""INSERT INTO jobs(id,owner,content,voice,provider,rate,kind,title,status,error,created,book_id,part_no,part_total)
-            VALUES(:id,:owner,:part,'female','edge','slow','reading',:title,:status,'',:created,:book,:number,:total)"""), values)
+        db.execute(text("""INSERT INTO jobs(id,owner,content,voice,provider,rate,kind,title,status,error,created,book_id,part_no,part_total,chapter_title,budget_due)
+            VALUES(:id,:owner,:part,'female','edge','slow','reading',:title,:status,'',:created,:book,:number,:total,:chapter,:due)"""), values)
         db.execute(text('INSERT INTO speech_usage(job_id,owner,created) VALUES(:id,:o,:t)'),
                    {'id': job, 'o': who, 't': time.time()})
         # Waiters reacquire QUEUE only after the transaction commits.
         QUEUE.notify_all()
-    return {'id': job, 'status': 'queued', 'book_id': book_id, 'parts': len(parts)}
+    return {'id': job, 'status': 'queued', 'book_id': book_id, 'parts': len(parts), 'chaptered':bool(named)}
 
 
 @app.get('/api/jobs')
@@ -480,7 +542,7 @@ def jobs(request: Request, offset: int = 0):
     if offset < 0 or offset > 10000:
         raise HTTPException(422, '历史页码无效。')
     with DB.connect() as db:
-        rows = db.execute(text('SELECT id,status,error,provider,voice,rate,kind,title,created,book_id,part_no,part_total FROM jobs WHERE owner=:o ORDER BY created DESC,part_no,id DESC LIMIT 20 OFFSET :offset'), {'o': who, 'offset': offset}).mappings().all()
+        rows = db.execute(text('SELECT id,status,error,provider,voice,rate,kind,title,created,book_id,part_no,part_total,chapter_title FROM jobs WHERE owner=:o ORDER BY created DESC,part_no,id DESC LIMIT 20 OFFSET :offset'), {'o': who, 'offset': offset}).mappings().all()
     items = [dict(row) for row in rows]
     for item in items:
         if item['status'] == 'processing':
@@ -495,14 +557,18 @@ def jobs(request: Request, offset: int = 0):
 def audio(job_id: uuid.UUID, request: Request):
     who = owner(request)
     with DB.connect() as db:
-        job = db.execute(text("SELECT provider FROM jobs WHERE id=:id AND owner=:o AND status='done'"), {'id': str(job_id), 'o': who}).scalar()
+        job = db.execute(text("SELECT provider,title,chapter_title,part_no FROM jobs WHERE id=:id AND owner=:o AND status='done'"), {'id': str(job_id), 'o': who}).mappings().first()
     if job is None:
         raise HTTPException(404, '音频不存在或尚未生成。')
-    ext = 'mp3' if job == 'edge' else 'wav'
+    ext = 'mp3' if job['provider'] == 'edge' else 'wav'
     path = DATA / f'{job_id}.{ext}'
     if not path.exists():
         raise HTTPException(404, '音频已过期，请重新生成。')
-    return FileResponse(path, media_type='audio/mpeg' if ext == 'mp3' else 'audio/wav', filename=f'朗读.{ext}')
+    label = '朗读'
+    if job['chapter_title']:
+        label = f"{Path(job['title']).stem[:45]}-{job['part_no']:02d}-{job['chapter_title'][:45]}"
+        label = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', '_', label)
+    return FileResponse(path, media_type='audio/mpeg' if ext == 'mp3' else 'audio/wav', filename=f'{label}.{ext}')
 
 
 def delete_readings(who, job_id=None, book_id=None):
@@ -527,6 +593,7 @@ def delete_readings(who, job_id=None, book_id=None):
                 advance_book(db, rows[0].book_id)
             if job_id is None and book_id is None:
                 db.execute(text('DELETE FROM drafts WHERE owner=:o'), params)
+                db.execute(text('DELETE FROM reading_outlines WHERE owner=:o'), params)
         for removed in ids:
             proc = RUNNING.get(removed)
             if proc is not None:

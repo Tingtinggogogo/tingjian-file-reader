@@ -549,10 +549,10 @@ def test_metadata_only_does_not_enqueue_or_charge(client):
 def test_book_cleaned_before_boundaries(client):
     content = '第一章\n' + ('这里保留引用 [2] 和结论。\n出版社：示例出版社\n通讯作者：作者甲\n' * 600) + '最后一句。'
     result = client.post('/api/books', json={'content':content,'title':'示例.epub','consent':True})
-    assert result.status_code == 202 and result.json()['parts'] > 1
+    assert result.status_code == 202 and result.json()['parts'] == 1 and result.json()['chaptered']
     with main.DB.connect() as db:
-        parts = db.execute(text('SELECT content FROM jobs WHERE book_id=:id ORDER BY part_no'),
-                           {'id':result.json()['book_id']}).scalars().all()
+        parts = db.execute(text('SELECT content FROM jobs WHERE id=:id'),
+                           {'id':result.json()['id']}).scalars().all()
     assert ''.join(parts) == '第一章\n' + '这里保留引用 [2] 和结论。\n' * 600 + '最后一句。'
 
 

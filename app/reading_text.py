@@ -145,10 +145,10 @@ def edge_key(line):
     return re.sub(r'(?:^\d{1,5}\s*[|｜–—-]\s*|\s*[|｜–—-]\s*\d{1,5}$)', '', value)
 
 
-def pdf_body(pages, margins):
+def pdf_pages(pages, margins):
     """Use repetition at the same margin; retain the first copy of a running title."""
     if len(pages) < 3:
-        return '\n'.join(pages)
+        return pages
     lines = [[s for s in page.splitlines() if s.strip()] for page in pages]
     removed = [set() for _ in pages]
     for top in (True, False):
@@ -182,4 +182,8 @@ def pdf_body(pages, margins):
                     if key in seen:
                         removed[page_index].add(pos)
                     seen.add(key)
-    return '\n'.join(row for rows, skip in zip(lines, removed) for i, row in enumerate(rows) if i not in skip)
+    return ['\n'.join(row for i,row in enumerate(rows) if i not in skip) for rows,skip in zip(lines,removed)]
+
+
+def pdf_body(pages, margins):
+    return '\n'.join(pdf_pages(pages,margins))

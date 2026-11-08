@@ -21,8 +21,8 @@ def epub_sample(chapters=None, extra=None, spine=None):
     return stream.getvalue()
 
 
-def mobi_sample(encrypted=False, compressed=False):
-    html = '<html><head><title>听见测试</title></head><body><h1>第一章</h1><p>你好，欢迎使用听见文件。</p><p>第二章，晚安。</p></body></html>'.encode()
+def mobi_sample(encrypted=False, compressed=False, html_content=None):
+    html = (html_content or '<html><head><title>听见测试</title></head><body><h1>第一章</h1><p>你好，欢迎使用听见文件。</p><p>第二章，晚安。</p></body></html>').encode()
     # PalmDOC literal chunks are valid compressed text; no proprietary encoder.
     encoded = b''.join(bytes([len(html[i:i+8])]) + html[i:i+8] for i in range(0, len(html), 8)) if compressed else html
     name = '听见文件测试'.encode()

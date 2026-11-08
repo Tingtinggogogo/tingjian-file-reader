@@ -1,6 +1,8 @@
 """Bounded extraction. Never execute uploads or fetch embedded resources."""
 import io
+from collections import Counter
 import json
+import re
 import zipfile
 from pathlib import Path
 from PIL import Image
@@ -9,7 +11,7 @@ SUPPORTED = {'.epub', '.mobi', '.txt', '.md', '.csv', '.json', '.log', '.pdf', '
 MAX_TEXT = 30000
 
 
-def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
+def extract(data: bytes, filename: str, temp_parent: Path | None = None, marks=None) -> str:
     ext = Path(filename).suffix.lower()
     if ext not in SUPPORTED:
         raise ValueError('暂不支持此类型。请转换为 EPUB、MOBI、PDF、DOCX、TXT、XLSX、PPTX 或图片。')
@@ -22,7 +24,7 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
                 raise ValueError('不支持加密文档。')
     if ext in {'.epub', '.mobi'}:
         from app.ebooks import epub_text, mobi_text
-        return epub_text(data) if ext == '.epub' else mobi_text(data, temp_parent)
+        return epub_text(data, marks) if ext == '.epub' else mobi_text(data, temp_parent, marks)
     elif ext == '.pdf':
         from pypdf import PdfReader
         if not data.startswith(b'%PDF-'):
@@ -55,12 +57,61 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
             if size > MAX_TEXT:
                 raise ValueError('提取文字超过 30000 字，请拆分文件。')
             chunks.append(chunk)
-        from app.reading_text import pdf_body
-        text = pdf_body(chunks, margins)
+        from app.reading_text import pdf_pages
+        from app.chapters import primary
+        pages = pdf_pages(chunks,margins)
+        if marks is not None:
+            outline = []
+            def visit(nodes, depth=1):
+                if depth > 12:
+                    return
+                for dest in nodes:
+                    if isinstance(dest,list):
+                        visit(dest,depth+1)
+                    else:
+                        n = reader.get_destination_page_number(dest)
+                        if n is not None and 0 <= n < len(pages) and dest.title:
+                            outline.append((depth,str(dest.title)[:160],n))
+            try:
+                visit(reader.outline)
+            except Exception:
+                outline.clear()
+            offsets, size = [], 0
+            for page in pages:
+                offsets.append(size)
+                size += len(page)+1
+            chosen = primary(outline)
+            per_page = Counter(entry[2] for entry in chosen)
+            for _,title,n in chosen:
+                matches = list(re.finditer(r'^\s*' + re.escape(title.strip()) + r'\s*$', pages[n], re.M))
+                if matches:
+                    marks.append((offsets[n]+matches[0].start(),title))
+                elif per_page[n] == 1 and pages[n].strip():
+                    marks.append((offsets[n],title))
+        text = '\n'.join(pages)
     elif ext == '.docx':
         from docx import Document
         doc = Document(io.BytesIO(data))
-        text = '\n'.join([p.text for p in doc.paragraphs] + [' '.join(c.text for c in row.cells) for table in doc.tables for row in table.rows])
+        from docx.text.paragraph import Paragraph
+        from app.chapters import primary
+        chunks, headings, size = [], [], 0
+        for element in doc.iter_inner_content():
+            if isinstance(element, Paragraph):
+                values = [element.text]
+                style = element.style.name if element.style else ''
+                heading = re.fullmatch(r'(?:Heading|标题)\s*([1-9])', style, re.I)
+                levels = element._p.xpath('./w:pPr/w:outlineLvl/@w:val')
+                if values[0].strip() and (heading or levels and levels[0] in tuple('012345678')):
+                    level = int(heading[1]) if heading else int(levels[0])+1
+                    headings.append((level, values[0].strip()[:160], size))
+            else:
+                values = [' '.join(c.text for c in row.cells) for row in element.rows]
+            for value in values:
+                chunks.append(value)
+                size += len(value)+1
+        text = '\n'.join(chunks)
+        if marks is not None:
+            marks.extend((pos,title) for _,title,pos in primary(headings))
     elif ext == '.xlsx':
         from openpyxl import load_workbook
         book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
@@ -109,6 +160,9 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
             raise ValueError('无法识别文本编码，请转换为 UTF-8。')
         if ext == '.json':
             text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+    if marks:
+        trim = len(text) - len(text.lstrip())
+        marks[:] = [(max(0,pos-trim),title) for pos,title in marks]
     text = text.strip()
     if not text:
         raise ValueError('没有提取到文字。扫描 PDF 请先转换为图片后上传识字。')

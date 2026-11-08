@@ -5,6 +5,7 @@ let content = '', filename = '', busy = false, ready = false, onlineVoice = fals
 let ebookLimit = 80 * 1024 * 1024, standardLimit = 20 * 1024 * 1024, partLimit = 5000;
 const isEbook = name => /\.(epub|mobi)$/i.test(name);
 const isLongBook = () => isEbook(filename) && [...content].length > partLimit;
+let chapterCount = 0;
 let syncChain = Promise.resolve();
 const message = text => { $('message').textContent = text; };
 function readLocal(key) { try { return localStorage.getItem(key); } catch { return null; } }
@@ -28,7 +29,8 @@ function showFile(status) {
   $('selected').hidden = !content;
   $('filename').textContent = filename || '已保存的文件';
   $('file-state').textContent = status || `已提取 ${content.length.toLocaleString()} 字，可以生成朗读`;
-  if (isLongBook()) $('file-state').textContent += '。整本会自动分部生成，可先听第一部分。';
+  if (chapterCount) $('file-state').textContent += '。已识别 ' + chapterCount + ' 个章节标题，每章生成一条音频。';
+  else if (isLongBook()) $('file-state').textContent += '。优先按章节生成，没有可靠目录时按阅读段生成。';
   controls();
 }
 function sync() {
@@ -61,7 +63,7 @@ $('file').addEventListener('change', async () => {
   busy = true; controls(); message('正在读取文件，请稍等…');
   try {
     const result = await api('/extract', { method: 'POST', body: data });
-    content = result.content; filename = result.filename;
+    content = result.content; filename = result.filename; chapterCount = result.chapter_count || 0;
     writeLocal(DRAFT_KEY, content); writeLocal(NAME_KEY, filename);
     showFile(); await sync(); message('文件已准备好，点击“生成朗读”即可。');
   } catch (e) { message(e.message); }
@@ -71,8 +73,8 @@ $('generate').addEventListener('click', async () => {
   if (busy || !content.trim() || !ready) return;
   busy = true; controls(); $('generate').textContent = '正在提交…';
   try {
-    const result = await api(isLongBook() ? '/books' : '/speech', json('POST', { content, title: filename || '文件朗读', consent: true }));
-    message(result.parts > 1 ? '已安排整本书的 ' + result.parts + ' 部分，生成后即可回听。' : '已开始生成，完成后在下方点击播放即可。'); await refresh();
+    const result = await api(isEbook(filename) ? '/books' : '/speech', json('POST', { content, title: filename || '文件朗读', consent: true }));
+    message(result.chaptered ? '已安排 ' + result.parts + ' 条章节音频，完成后可在历史中按章收听。' : result.parts > 1 ? '未识别到可靠章节，已按 ' + result.parts + ' 个阅读段安排朗读。' : '已开始生成，完成后在下方点击播放即可。'); await refresh();
     $('history-title').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) { message(e.message); }
   finally { busy = false; $('generate').textContent = '生成朗读'; controls(); }
@@ -81,10 +83,11 @@ function renderJob(job) {
   const node = document.createElement('article'); node.className = 'job'; node.dataset.id = job.id; node.dataset.status = job.status;
   const top = document.createElement('div'); top.className = 'job-top';
   const label = document.createElement('strong'); label.textContent = job.kind === 'preview' ? '声音试听' : job.title || '文件朗读';
-  if (job.book_id) label.textContent += ' · 第 ' + job.part_no + '/' + job.part_total + ' 部分';
+  if (job.chapter_title) label.textContent = job.chapter_title;
+  else if (job.book_id) label.textContent += ' · 第 ' + job.part_no + '/' + job.part_total + ' 部分';
   const state = document.createElement('span'); state.textContent = ({ scheduled: '等待前一部分', queued: '等待中', processing: '生成中…', done: '可以收听', failed: '生成失败' })[job.status];
   top.append(label, state); node.append(top);
-  const meta = document.createElement('p'); meta.className = 'job-meta'; meta.textContent = new Date(job.created * 1000).toLocaleString('zh-CN', { hour12: false }) + (job.provider === 'edge' ? ' · 自然语音' : ' · 旧版离线录音'); node.append(meta);
+  const meta = document.createElement('p'); meta.className = 'job-meta'; meta.textContent = new Date(job.created * 1000).toLocaleString('zh-CN', { hour12: false }) + (job.provider === 'edge' ? ' · 自然语音' : ' · 旧版离线录音'); if (job.chapter_title) meta.textContent = job.title + ' · ' + job.part_no + '/' + job.part_total + ' · ' + meta.textContent; node.append(meta);
   if (job.status === 'done') {
     const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'none'; audio.src = '/api/audio/' + job.id;
     audio.addEventListener('error', () => message('音频加载失败，请检查网络；超过 30 天的录音需要重新生成。'));

@@ -11,6 +11,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from app.chapters import primary, text_marks
 from defusedxml import ElementTree as ET
 
 MAX_EXPANDED = 256 * 1024 * 1024
@@ -36,6 +37,7 @@ class ChapterText(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.stack, self.chunks = [], []
+        self.anchors, self.headings, self.open_headings = {}, [], {}
 
     def add(self, value):
         self.chunks.append(value)
@@ -49,6 +51,12 @@ class ChapterText(HTMLParser):
         hidden = hidden or bool(semantics & {'copyright-page', 'colophon', 'pagebreak'})
         hidden = hidden or bool(roles & {'doc-pagebreak', 'doc-colophon'})
         hidden = hidden or bool(self.stack and self.stack[-1][1])
+        if not hidden:
+            for key in ('id', 'name'):
+                if attributes.get(key):
+                    self.anchors.setdefault(attributes[key], len(self.chunks))
+            if tag in {'h1','h2','h3'}:
+                self.open_headings[tag] = len(self.chunks)
         if not hidden and tag in self.BLOCK:
             self.add('\n')
         if tag not in self.VOID:
@@ -61,6 +69,11 @@ class ChapterText(HTMLParser):
 
     def handle_endtag(self, tag):
         tag = tag.split(':')[-1]
+        if tag in self.open_headings:
+            start = self.open_headings.pop(tag)
+            title = ' '.join(''.join(self.chunks[start:]).split())
+            if title:
+                self.headings.append((int(tag[1]), title[:160], start))
         hidden = bool(self.stack and self.stack[-1][1])
         for index in range(len(self.stack) - 1, -1, -1):
             if self.stack[index][0] == tag:
@@ -76,7 +89,7 @@ class ChapterText(HTMLParser):
             self.add(re.sub(r'\s+', ' ', data))
 
 
-def chapter_text(raw: bytes) -> str:
+def chapter_text(raw, targets, use_headings):
     encoding = 'utf-16' if raw.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
     parser = ChapterText()
     try:
@@ -84,10 +97,79 @@ def chapter_text(raw: bytes) -> str:
         parser.close()
     except UnicodeError as exc:
         raise ValueError('电子书文字编码无效，请转换为 UTF-8 EPUB。') from exc
-    return '\n'.join(line.strip() for line in ''.join(parser.chunks).splitlines() if line.strip())
+    cuts = {0: targets.get('', '')}
+    for anchor,title in targets.items():
+        if anchor and anchor in parser.anchors:
+            cuts[parser.anchors[anchor]] = title
+    if use_headings or (targets and not any(cuts.values())):
+        for _,title,idx in primary(parser.headings):
+            cuts[idx] = title
+    points = sorted(cuts)
+    blocks = []
+    for start,end in zip(points,points[1:] + [len(parser.chunks)]):
+        value = '\n'.join(line.strip() for line in ''.join(parser.chunks[start:end]).splitlines() if line.strip())
+        if value:
+            blocks.append((cuts[start], value))
+        elif cuts[start] and end < len(parser.chunks):
+            cuts[end] = cuts[start]
+    return blocks
 
 
-def epub_text(data: bytes | Path) -> str:
+def toc_targets(items, spine_element, base, read):
+    for item in items.values():
+        nav = 'nav' in item.get('properties', '').split()
+        ncx = item.get('media-type') == 'application/x-dtbncx+xml'
+        if not nav and not ncx:
+            continue
+        if ncx and spine_element.get('toc') not in (None,item.get('id')):
+            continue
+        try:
+            path = member_path(base,item.get('href',''))
+            root = ET.fromstring(read(path))
+            entries = []
+            if nav:
+                node = next((n for n in root.findall('.//{*}nav') if 'toc' in
+                             n.get('{http://www.idpf.org/2007/ops}type','').split()),None)
+                if node is None:
+                    continue
+                def visit_list(ol, depth):
+                    if ol is None or depth > 12:
+                        return
+                    for li in ol.findall('./{*}li'):
+                        link = li.find('./{*}a')
+                        if link is not None:
+                            entries.append((depth,' '.join(''.join(link.itertext()).split()),link.get('href','')))
+                        visit_list(li.find('./{*}ol'),depth+1)
+                visit_list(node.find('./{*}ol'),1)
+            else:
+                def visit_points(parent, depth):
+                    if parent is None or depth > 12:
+                        return
+                    for point in parent.findall('./{*}navPoint'):
+                        label = point.find('./{*}navLabel/{*}text')
+                        link = point.find('./{*}content')
+                        if label is not None and link is not None:
+                            entries.append((depth,''.join(label.itertext()).strip(),link.get('src','')))
+                        visit_points(point,depth+1)
+                visit_points(root.find('.//{*}navMap'),1)
+            result = {}
+            for _,title,href in primary(entries):
+                if not title or not href:
+                    continue
+                try:
+                    member = member_path(posixpath.dirname(path),href)
+                except ValueError:
+                    continue
+                result.setdefault(member,{})[unquote(urlsplit(href).fragment)] = title[:160]
+            if result:
+                return result
+        except (ValueError, KeyError, ET.ParseError):
+            # A missing navigation document need not invalidate readable spine content.
+            continue
+    return {}
+
+
+def epub_text(data: bytes | Path, marks=None) -> str:
     try:
         with zipfile.ZipFile(data if isinstance(data, Path) else io.BytesIO(data)) as book:
             def read_member(name):
@@ -116,6 +198,8 @@ def epub_text(data: bytes | Path) -> str:
             if 'META-INF/encryption.xml' in names:
                 for ref in ET.fromstring(read_member('META-INF/encryption.xml')).findall('.//{*}CipherReference'):
                     encrypted.add(member_path('', ref.get('URI', '')))
+            toc = toc_targets(manifest, package.find('./{*}spine'), base, read_member) if marks is not None else {}
+            reliable_toc = sum(map(len,toc.values())) > 1
             chunks, size = [], 0
             spine = package.findall('./{*}spine/{*}itemref')
             if not spine:
@@ -129,13 +213,18 @@ def epub_text(data: bytes | Path) -> str:
                 path = member_path(base, item.get('href', ''))
                 if path in encrypted:
                     raise ValueError('不支持加密或 DRM 保护的电子书。')
-                chunk = chapter_text(read_member(path))
-                if not chunk:
-                    continue
-                size += len(chunk) + (1 if chunks else 0)
-                if size > MAX_TEXT:
-                    raise ValueError('提取文字超过 30 万字，请拆分电子书。')
-                chunks.append(chunk)
+                blocks = chapter_text(read_member(path), toc.get(path,{}), not reliable_toc and marks is not None)
+                for title,chunk in blocks:
+                    start = size + (1 if chunks else 0)
+                    if marks is not None:
+                        if title:
+                            marks.append((start,title))
+                        if not reliable_toc:
+                            marks.extend((start+pos,t) for pos,t in text_marks(chunk) if pos or not title)
+                    size = start + len(chunk)
+                    if size > MAX_TEXT:
+                        raise ValueError('提取文字超过 30 万字，请拆分电子书。')
+                    chunks.append(chunk)
             result = '\n'.join(chunks)
             if not result:
                 raise ValueError('电子书没有可提取的正文文字，纯图片电子书暂不支持。')
@@ -146,7 +235,7 @@ def epub_text(data: bytes | Path) -> str:
         raise ValueError('EPUB 已损坏或章节目录无效，请重新导出后上传。') from exc
 
 
-def mobi_text(data: bytes | Path, temp_parent: Path | None = None) -> str:
+def mobi_text(data: bytes | Path, temp_parent: Path | None = None, marks=None) -> str:
     # Validate the Palm database before starting the native decoder.
     size = data.stat().st_size if isinstance(data, Path) else len(data)
     with (data.open('rb') if isinstance(data, Path) else io.BytesIO(data)) as stream:
@@ -187,4 +276,4 @@ def mobi_text(data: bytes | Path, temp_parent: Path | None = None) -> str:
         output = root / 'book.epub'
         if not output.is_file() or output.stat().st_size > MAX_EXPANDED:
             raise ValueError('MOBI 未能转换为可朗读电子书，或内容过大。')
-        return epub_text(output)
+        return epub_text(output, marks)

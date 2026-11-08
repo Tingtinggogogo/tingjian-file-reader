@@ -10,7 +10,7 @@
 
 ## 源码与分支
 
-唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、50 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
+唯一源码为 GitHub 仓库。新仓库先在 main 建立纯说明基线，再从该提交创建 feat/file-reader。所有业务改动通过 PR，不直接提交 main、不自动合并。依赖审计、58 项回归、PostgreSQL 测试和 Docker build 在 test-and-build 中执行。仓库管理员需在 GitHub 分支保护中设置 main 必须 PR 且要求 test-and-build 成功；仅有 workflow 文件不代表保护已经启用。
 
 ## 环境准备
 
@@ -99,3 +99,7 @@ MOBI 子进程限制 45 秒墙钟时间、40 秒 CPU、256 MiB 地址空间（Li
 本版向 jobs 增加整本编号、部号、总数和排队时间，向 drafts 增加文件名，以 speech_usage 独立记录近一小时提交用量。启动时兼容已有录音，恢复中断任务。每个任务使用自己的临时目录，最终音频完成后原子发布。删除时先撤销数据库记录，再停止子进程组并清理部分音频。启动时清理意外中断遗留的未发布文件。
 
 从通过 CI 的 GitHub 提交构建独立 app。更新 app 和本项目 web，保留数据库及音频卷。web 单文件挂载的 nginx 配置有变动时需重建 web 容器以重新挂载文件。上传缓冲使用数据卷中的 spool 目录。部署后验证 Nginx 配置、80 MB 上传入口、实际 FFmpeg 合并、单条/整本删除和健康状态。旧版本回滚前应完成或取消新版本的整本任务，旧程序无法继续 scheduled 部分。
+
+## 按章朗读
+
+本次增加 reading_outlines 表并向 jobs 增加 chapter_title、budget_due 两列，旧任务使用默认值。目录属于当前匿名会话，按文件名与正文摘要匹配，随草稿续期并定期清理。保留原 PostgreSQL 及音频卷，仅重建本工具 app。已合成的旧录音继续使用原格式。回滚前应完成或取消按新规则等待的章节任务。
