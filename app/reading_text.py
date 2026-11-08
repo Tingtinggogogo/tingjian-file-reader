@@ -5,7 +5,7 @@ from pathlib import Path
 from collections import Counter
 
 FIELD_NAMES = (
-    r'通讯作者|通信作者|通讯地址|通信地址|作者单位|作者简介|'
+    r'页眉|页脚|页码|running head|通讯作者|通信作者|通讯地址|通信地址|作者单位|作者简介|'
     r'电子邮(?:件|箱)|作者邮箱|联系邮箱|联系电话|邮政编码|邮编|'
     r'出版社|出版单位|出版发行|出版日期|出版时间|出版地|印刷单位|责任编辑|'
     r'版次|印次|印刷日期|定价|文章编号|中图分类号|文献标识码|收稿日期|修回日期|录用日期|网络出版日期|'
@@ -102,6 +102,13 @@ def table_lines(content, delimiter):
 
 
 def spoken_text(content, filename=''):
+    if '\f' in content:
+        pages = content.split('\f')
+        margins = []
+        for page in pages:
+            lines = [line.strip() for line in page.splitlines() if line.strip()]
+            margins.append((set(lines[:1]), set(lines[-1:])))
+        content = pdf_body(pages, margins)
     suffix = Path(filename).suffix.casefold()
     if suffix in {'.csv', '.xlsx'}:
         delimiter = '，' if suffix == '.xlsx' else ','

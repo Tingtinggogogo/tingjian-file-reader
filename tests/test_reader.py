@@ -525,6 +525,10 @@ def test_spoken_body_shared_by_drafts_files_and_whole_books(client):
         with main.DB.connect() as db:
             assert db.execute(text('SELECT content FROM jobs WHERE id=:id'), result.json()).scalar_one() == body
     assert client.get('/api/draft').json()['content'] == noisy
+    plain_pages = '\f'.join(f'重复刊名测试\n结果 {n}。\n{n}' for n in range(1, 4))
+    plain = extract(plain_pages.encode(), 'pages.txt')
+    assert spoken_text(plain).splitlines() == ['重复刊名测试', '结果 1。', '结果 2。', '结果 3。']
+    assert spoken_text('页眉：卷名\n保留这一句。\n页脚：内部文件') == '保留这一句。'
     assert spoken_text('通讯作者：王某。摘要：保留摘要。') == '摘要：保留摘要。'
     assert spoken_text('正文中引用 doi:10.1234/test 和 user@example.org。') == '正文中引用 doi:10.1234/test 和 user@example.org。'
     assert spoken_text('请写信给reader@example.org。') == '请写信给reader@example.org。'

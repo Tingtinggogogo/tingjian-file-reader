@@ -100,7 +100,7 @@ def extract(data: bytes, filename: str, temp_parent: Path | None = None) -> str:
                 if encoding == 'utf-16' and not data.startswith((b'\xff\xfe', b'\xfe\xff')):
                     continue
                 candidate = data.decode(encoding)
-                if not any(ord(c) < 32 and c not in '\n\r\t' for c in candidate):
+                if not any(ord(c) < 32 and c not in '\n\r\t\f' for c in candidate):
                     text = candidate
                     break
             except UnicodeError:
